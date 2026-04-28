@@ -7,6 +7,7 @@
 #include <quake_index.h>
 #include <clustering.h>
 #include <fstream>
+#include <query_coordinator.h>
 
 QuakeIndex::QuakeIndex(int current_level) {
     // Initialize the QuakeIndex

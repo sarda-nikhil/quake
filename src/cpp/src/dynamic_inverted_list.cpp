@@ -39,10 +39,10 @@ namespace faiss {
     }
 
 
-    DynamicInvertedLists::DynamicInvertedLists(size_t nlist, size_t code_size)
+    DynamicInvertedLists::DynamicInvertedLists(size_t nlist, size_t code_size, int dim)
         : nlist(nlist), code_size(code_size) {
-          
-        d_ = code_size / sizeof(float);
+
+        d_ = (dim > 0) ? dim : static_cast<int>(code_size / sizeof(float));
         code_size_ = code_size;
         // Initialize empty partitions
         for (size_t i = 0; i < nlist; i++) {

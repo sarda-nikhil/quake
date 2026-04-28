@@ -1,8 +1,10 @@
 #include "maintenance_cost_estimator.h"
-#include <list_scanning.h>
 #include <stdexcept>
 #include <iostream>
 #include <fstream>
+
+#include "partition_representation.h"
+#include "topk_buffer.h"
 
 // A simple helper to split a string by delimiter.
 // You can replace this with any library function if you wish.
@@ -77,12 +79,27 @@ void ListScanLatencyEstimator::profile_scan_latency() {
             const float *query_ptr = query.data_ptr<float>();
             const float *curr_vectors_ptr = curr_vectors.data_ptr<float>();
             const int64_t *curr_ids_ptr = curr_ids.data_ptr<int64_t>();
+            Fp32PartitionRepresentation representation(d_);
 
             uint64_t total_latency_ns = 0;
             for (int m = 0; m < n_trials_; ++m) {
                 auto start = std::chrono::high_resolution_clock::now();
-                scan_list(query_ptr, curr_vectors_ptr, curr_ids_ptr, n, d_,
-                          *topk_buffer, faiss::METRIC_L2, 10000000.0);
+                vector<shared_ptr<TopkBuffer>> active_buffers = {topk_buffer};
+                representation.scan_partition(
+                    query_ptr,
+                    1,
+                    nullptr,
+                    reinterpret_cast<const uint8_t*>(curr_vectors_ptr),
+                    curr_ids_ptr,
+                    n,
+                    active_buffers,
+                    faiss::METRIC_L2,
+                    {},
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    BLAS_DB_BS,
+                    1);
                 auto end = std::chrono::high_resolution_clock::now();
 
                 auto duration =

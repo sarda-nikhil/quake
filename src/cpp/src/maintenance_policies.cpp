@@ -6,6 +6,7 @@
 #include <torch/torch.h>
 
 #include "quake_index.h"
+#include "parallel.h"
 
 using std::chrono::steady_clock;
 using std::chrono::microseconds;
@@ -111,9 +112,10 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                     search_params->k = 2; // get the top 2 partitions, ignore the first one as it is the partition itself
                     search_params->batched_scan = true;
                     search_params->track_hits = false;
-                    float *partition_vectors = (float *) partition_manager_->partition_store_->partitions_[partition_id]->codes_;
-                    Tensor part_vecs = torch::from_blob(partition_vectors, {(int64_t) partition_manager_->partition_store_->list_size(partition_id),
-                                                                           partition_manager_->d()}, torch::kFloat32);
+                    Tensor single_partition = torch::tensor({partition_id}, torch::kInt64);
+                    shared_ptr<Clustering> selected_partition =
+                        partition_manager_->select_partitions(single_partition, true);
+                    Tensor part_vecs = selected_partition->vectors[0];
                     auto res = partition_manager_->parent_->search(part_vecs, search_params);
 
                     Tensor reassign_ids = res->ids.flatten();

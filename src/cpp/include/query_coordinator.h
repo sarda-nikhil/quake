@@ -8,8 +8,9 @@
 #define QUERY_COORDINATOR_H
 
 #include <common.h>
-#include <list_scanning.h>
+#include <faiss/impl/ResultHandler.h>
 #include <maintenance_policies.h>
+#include <topk_buffer.h>
 #include <sorting/readerwriterqueue.h>
 #include <concurrentqueue.h>
 #include "blockingconcurrentqueue.h"

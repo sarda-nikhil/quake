@@ -8,8 +8,9 @@
 #include <faiss/IndexFlat.h>
 #include "faiss/Clustering.h"
 #include "index_partition.h"
-#include <list_scanning.h>
+#include "partition_representation.h"
 #include <query_coordinator.h>
+#include <topk_buffer.h>
 #include <omp.h>
 
 #ifdef QUAKE_ENABLE_GPU
@@ -262,6 +263,7 @@ tuple<Tensor, vector<shared_ptr<IndexPartition> >> kmeans_refine_partitions(
 
     vector<shared_ptr<IndexPartition>> prev_partitions = partitions;
     vector<shared_ptr<IndexPartition>> new_partitions;
+    Fp32PartitionRepresentation representation(d);
 
     for (int iter = 0; iter < iterations; iter++) {
         if (iter > 0) {
@@ -298,21 +300,21 @@ tuple<Tensor, vector<shared_ptr<IndexPartition> >> kmeans_refine_partitions(
             float *part_vecs = (float *) part->codes_;
             int64_t *part_vec_ids = part->ids_;
 
-            // Use batched_scan_list to get nearest centroid for each vector.
-            batched_scan_list(part_vecs,
-                              centroids_ptr,
-                              centroid_ids_ptr,
-                              nvec,
-                              n_clusters,
-                              d,
-                              buffers,
-                                metric,
-                                nullptr,
-                                nullptr,
-                                nullptr,
-                                128,
-                                BLAS_DB_BS,
-                                {});
+            representation.scan_partition(
+                part_vecs,
+                static_cast<int>(nvec),
+                nullptr,
+                reinterpret_cast<const uint8_t*>(centroids_ptr),
+                centroid_ids_ptr,
+                n_clusters,
+                buffers,
+                metric,
+                {},
+                nullptr,
+                nullptr,
+                nullptr,
+                BLAS_DB_BS,
+                static_cast<int>(nvec));
 
             // For each vector in this partition, determine its assignment.
             for (int i = 0; i < nvec; i++) {

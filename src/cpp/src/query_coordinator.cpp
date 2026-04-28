@@ -6,20 +6,24 @@
 #include <iostream>
 #include <chrono>
 #include <cmath>
+#include <unistd.h>
 #include <partition_manager.h>
 #include <quake_index.h>
 #include <geometry.h>
 #include <parallel.h>
 //#include "parallel_hashmap/btree.h"
 
+#include <cmath>
+#ifdef __linux__
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <linux/perf_event.h>
-#include <cmath>
+#endif
 
 int QueryCoordinator::batch_scan_partition_chunk_size_ = BLAS_DB_BS;
 int QueryCoordinator::batch_scan_query_chunk_size_ = DEFAULT_BLAS_Q_BS;
 
+#ifdef __linux__
 // Wrapper for the system call since glibc doesn't provide one
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
                             int cpu, int group_fd, unsigned long flags) {
@@ -116,6 +120,16 @@ public:
         return (100.0 * (double) cache_count_misses) / (double)cache_count_refs;
     }
 };
+#else
+class MetricTracker {
+public:
+    void perform_setup() {}
+    void start() {}
+    void stop_and_record() {}
+    double get_ipc() { return 0.0; }
+    double get_cache_miss_rate() { return 0.0; }
+};
+#endif
 
 static void ensure_blas_buffers(QueryCoordinator::CoreResources& res,
                                 size_t max_q,
@@ -341,12 +355,8 @@ void QueryCoordinator::process_scan_job(ScanJob job,
     NUMAResources &nr = numa_resources_[numa_node];
 
     // Attempt to fetch partition data; if the list doesn't exist, catch and enqueue empty results.
-    const float   *codes = nullptr;
-    const int64_t *ids   = nullptr;
     int64_t part_size    = 0;
     try {
-        codes     = (float *)(partition_manager_->partition_store_->get_codes(job.partition_id));
-        ids       = (int64_t *) partition_manager_->partition_store_->get_ids(job.partition_id);
         part_size = partition_manager_->partition_store_->list_size(job.partition_id);
     } catch (const std::exception &e) {
         std::cerr << "[process_scan_job] Partition " << job.partition_id
@@ -426,13 +436,11 @@ void QueryCoordinator::handle_nonbatched_job(const ScanJob &job,
     res.topk_buffer_pool[0]->reset();
 
     try {
-        const float* codes = (float*)partition_manager_->partition_store_->get_codes(job.partition_id);
-        const int64_t* ids = (int64_t*)partition_manager_->partition_store_->get_ids(job.partition_id);
         int64_t part_size = partition_manager_->partition_store_->list_size(job.partition_id);
         int D = partition_manager_->d();
 
         // Defensive check for partition validity right before scan
-        if (!codes || !ids || part_size <= 0) {
+        if (part_size <= 0) {
             std::cerr << "[QueryCoordinator::handle_nonbatched_job] Partition " << job.partition_id
                       << " invalid or empty before scan for query " << job.query_id
                       << ". Enqueuing empty result.\n";
@@ -444,21 +452,21 @@ void QueryCoordinator::handle_nonbatched_job(const ScanJob &job,
 
         auto start = std::chrono::high_resolution_clock::now();
 
-        scan_list(nr.local_query_buffer + (job.query_id * D),
-                  codes,
-                  ids,
-                  part_size,
-                  D,
-                  *buf,
-                  metric_,
-                  query_dist_pivots_[job.query_id].load(std::memory_order_relaxed));
+        vector<shared_ptr<TopkBuffer>> active_buffers = {buf};
+        vector<std::atomic<float>*> pivots = {&query_dist_pivots_[job.query_id]};
+        partition_manager_->scan_partition(nr.local_query_buffer + (job.query_id * D),
+                                           1,
+                                           job.partition_id,
+                                           active_buffers,
+                                           metric_,
+                                           pivots);
 
         auto end = std::chrono::high_resolution_clock::now();
 
         int64_t scan_time = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
         res.scan_time_ns += scan_time;
 
-        int64_t total_partition_bytes = part_size * D * sizeof(float) + part_size * sizeof(int64_t);
+        int64_t total_partition_bytes = part_size * partition_manager_->code_size_bytes() + part_size * sizeof(int64_t);
         int64_t total_query_bytes = D * sizeof(float);
         int64_t total_scan_bytes = total_partition_bytes + total_query_bytes;
         res.bytes_scan_total += total_scan_bytes;
@@ -505,10 +513,8 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
     MetricTracker* metrics_tracker = (MetricTracker*) nr.metric_tracker_ptr;
 
     // Fetch partition data
-    const float   *codes     = (float *) partition_manager_->partition_store_->get_codes(job.partition_id);
-    const int64_t *ids       = partition_manager_->partition_store_->get_ids(job.partition_id);
     int64_t        part_size = partition_manager_->partition_store_->list_size(job.partition_id);
-    if (!codes || !ids || part_size <= 0) {
+    if (part_size <= 0) {
         for (int64_t i = 0; i < Q; ++i) {
             enqueue_result_job(ResultJob{(*job.query_ids)[i], (*job.ranks)[i], {}, {}});
         }
@@ -618,18 +624,21 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
         metrics_tracker->start();
     }
 
-    batched_scan_list(
-            qptr,
-            codes, ids,
-            query_ids.size(), part_size, D,
-            res.topk_buffer_pool,
-            metric_,
-            res.blas_ip_block,
-            res.blas_norms_x,
-            res.blas_norms_y,
-            QueryCoordinator::batch_scan_partition_chunk_size_,
-            Q,
-            pivots);
+    vector<shared_ptr<TopkBuffer>> active_buffers(
+        res.topk_buffer_pool.begin(),
+        res.topk_buffer_pool.begin() + static_cast<std::ptrdiff_t>(query_ids.size()));
+    partition_manager_->scan_partition(
+        qptr,
+        static_cast<int>(query_ids.size()),
+        job.partition_id,
+        active_buffers,
+        metric_,
+        pivots,
+        res.blas_ip_block,
+        res.blas_norms_x,
+        res.blas_norms_y,
+        QueryCoordinator::batch_scan_partition_chunk_size_,
+        Q);
     
     if constexpr(RUN_WITH_HARDWARE_COUNTERS) {
         metrics_tracker->stop_and_record();
@@ -642,7 +651,7 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
     res.scan_time_ns += scan_time;
     
     // Record batch scan metadata
-    int64_t partition_bytes = part_size * D * sizeof(float) + part_size * sizeof(int64_t);
+    int64_t partition_bytes = part_size * partition_manager_->code_size_bytes() + part_size * sizeof(int64_t);
     int64_t query_bytes = query_ids.size() * D * sizeof(float);
     int64_t total_bytes = partition_bytes  + query_bytes;
     res.bytes_scan_total += total_bytes;
@@ -1533,18 +1542,12 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
             }
 
             start_time = high_resolution_clock::now();
-            float *list_vectors = (float *) partition_manager_->partition_store_->get_codes(pi);
-            int64_t *list_ids = (int64_t *) partition_manager_->partition_store_->get_ids(pi);
-            int64_t list_size = partition_manager_->partition_store_->list_size(pi);
-
-            scan_list(query_vec,
-                      list_vectors,
-                      list_ids,
-                      partition_manager_->partition_store_->list_size(pi),
-                      dimension,
-                      *topk_buf,
-                      metric_,
-                      NULL);
+            vector<shared_ptr<TopkBuffer>> active_buffers = {topk_buf};
+            partition_manager_->scan_partition(query_vec,
+                                               1,
+                                               pi,
+                                               active_buffers,
+                                               metric_);
             scanned_ids.push_back(pi);
 
             float curr_radius = topk_buf->get_kth_distance();
@@ -1765,8 +1768,6 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
 
     // Get the partition information
     int64_t pid = partition_ids[0].item<int64_t>();
-    const float *list_codes = (float *) partition_manager_->partition_store_->get_codes(pid);
-    const int64_t *list_ids = partition_manager_->partition_store_->get_ids(pid);
     int64_t list_size = partition_manager_->partition_store_->list_size(pid);
 
     // Buffers for each query batch
@@ -1808,23 +1809,22 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
 
         // Perform a single batched scan on the partition.
         auto s3 = high_resolution_clock::now();
-        batched_scan_list(batch_queries,
-                          list_codes,
-                          list_ids,
-                          num_batch_queries,
-                          list_size,
-                          d,
-                          global_buffers,
-                          metric_,
-                          nullptr,
-                          nullptr,
-                          nullptr,
-                          BLAS_DB_BS,
-                          DEFAULT_BLAS_Q_BS,
-                          {});
+        partition_manager_->scan_partition(batch_queries,
+                                           num_batch_queries,
+                                           pid,
+                                           global_buffers,
+                                           metric_,
+                                           {},
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           BLAS_DB_BS,
+                                           DEFAULT_BLAS_Q_BS);
        
         auto e3 = high_resolution_clock::now();
-        job_scan_bytes += (num_batch_queries + list_size) * d * sizeof(float) + list_size * sizeof(idx_t);
+        job_scan_bytes += list_size * partition_manager_->code_size_bytes() +
+                          num_batch_queries * d * sizeof(float) +
+                          list_size * sizeof(idx_t);
         job_scan_time += duration_cast<nanoseconds>(e3 - s3).count();
 
         // Merge the local results into the corresponding global buffers.

@@ -30,7 +30,7 @@ namespace faiss {
         int curr_list_id_ = 0;         ///< Next available partition ID.
         int total_numa_nodes_ = 0;     ///< Total NUMA nodes available.
         int next_numa_node_ = 0;       ///< Next NUMA node to use (for round-robin allocation).
-        int d_;                        ///< Dimensionality of the vectors (derived from code_size).
+        int d_;                        ///< Logical vector dimensionality for the stored payloads.
         int code_size_;                ///< Size in bytes of each vector code.
         unordered_map<size_t, shared_ptr<IndexPartition>> partitions_; ///< Map of partition ID to IndexPartition.
         unordered_map<int64_t, std::pair<IndexPartition*, int64_t>> id_to_location_;
@@ -44,7 +44,7 @@ namespace faiss {
          * @param nlist Number of partitions to initialize.
          * @param code_size Size in bytes for each code.
          */
-        DynamicInvertedLists(size_t nlist, size_t code_size);
+        DynamicInvertedLists(size_t nlist, size_t code_size, int dim = -1);
 
         /**
          * @brief Destructor.

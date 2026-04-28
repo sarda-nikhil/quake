@@ -9,6 +9,7 @@
 
 #include <common.h>
 #include <dynamic_inverted_list.h>
+#include <partition_representation.h>
 
 class QuakeIndex;
 
@@ -25,7 +26,9 @@ class PartitionManager {
 public:
     shared_ptr<QuakeIndex> parent_ = nullptr; ///< Pointer to a higher-level parent index.
     std::shared_ptr<faiss::DynamicInvertedLists> partition_store_ = nullptr; ///< Pointer to the inverted lists.
+    shared_ptr<PartitionRepresentation> representation_ = nullptr; ///< Semantics of the leaf payload bytes.
     int64_t curr_partition_id_ = 0; ///< Current partition ID.
+    int dim_ = 0; ///< Logical dimension of the vectors stored in this level.
     int num_workers_ = 0; ///< Number of workers for parallel processing.
 
     bool debug_ = false; ///< If true, print debug information.
@@ -42,6 +45,11 @@ public:
      * @brief Destructor.
      */
     ~PartitionManager();
+
+    /**
+     * @brief Set the active leaf representation.
+     */
+    void set_representation(shared_ptr<PartitionRepresentation> representation);
 
     /**
      * @brief Initialize partitions with a clustering
@@ -76,6 +84,22 @@ public:
      * @param ids Vector of IDs.
      */
      vector<float *> get_vectors(vector<int64_t> ids);
+
+    /**
+     * @brief Scan one partition against one or more queries through the active
+     * representation.
+     */
+    void scan_partition(const float* queries,
+                        int nq,
+                        int64_t partition_id,
+                        vector<shared_ptr<TopkBuffer>>& topk_buffers,
+                        MetricType metric,
+                        const vector<std::atomic<float>*>& pivots = {},
+                        float* ip_block = nullptr,
+                        float* norms_x = nullptr,
+                        float* norms_y = nullptr,
+                        int blas_db_bs = BLAS_DB_BS,
+                        int blas_q_bs = DEFAULT_BLAS_Q_BS) const;
 
     /**
      * @brief Split a given partition into multiple smaller ones.
@@ -160,6 +184,11 @@ public:
     int d() const;
 
     /**
+     * @brief Return the representation code size in bytes.
+     */
+    int code_size_bytes() const;
+
+    /**
      * @brief Get the sizes of the partitions.
      * @param partition_ids Tensor of shape [num_partitions] containing partition IDs.
      */
@@ -203,6 +232,13 @@ public:
      * @param path Path to load the partition manager.
      */
     void load(const string &path);
+
+private:
+    unordered_map<int64_t, vector<float>> local_centroids_;
+
+    bool get_partition_centroid(int64_t partition_id, float* centroid_out) const;
+    void set_local_centroids(shared_ptr<Clustering> clustering);
+    void clear_local_centroids();
 };
 
 

@@ -10,7 +10,8 @@
 #include <maintenance_policies.h>
 #include <dynamic_inverted_list.h>
 #include <partition_manager.h>
-#include <query_coordinator.h>
+
+class QueryCoordinator;
 
 /**
  * @brief Class that manages a Quake partitioned index. Provides methods for building, modifying, searching, and maintaining the index..

@@ -10,24 +10,57 @@
 #include "clustering.h"
 #include <stdexcept>
 #include <iostream>
+#include "parallel.h"
 #include "quake_index.h"
 
 using std::runtime_error;
 
-/**
- * @brief Helper: interpret float32 data as a uint8_t* (for storing in InvertedLists).
- */
-static inline const uint8_t *as_uint8_ptr(const Tensor &float_tensor) {
-    return reinterpret_cast<const uint8_t *>(float_tensor.data_ptr<float>());
-}
-
 PartitionManager::PartitionManager() {
     parent_ = nullptr;
     partition_store_ = nullptr;
+    representation_ = nullptr;
+    dim_ = 0;
 }
 
 PartitionManager::~PartitionManager() {
     // no special cleanup
+}
+
+void PartitionManager::set_representation(shared_ptr<PartitionRepresentation> representation) {
+    representation_ = representation;
+}
+
+void PartitionManager::clear_local_centroids() {
+    local_centroids_.clear();
+}
+
+void PartitionManager::set_local_centroids(shared_ptr<Clustering> clustering) {
+    clear_local_centroids();
+    if (!clustering || !clustering->centroids.defined()) {
+        return;
+    }
+
+    Tensor centroids = clustering->centroids.contiguous();
+    auto centroids_ptr = centroids.data_ptr<float>();
+    auto partition_ids_accessor = clustering->partition_ids.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < clustering->partition_ids.size(0); ++i) {
+        const float* centroid_ptr = centroids_ptr + i * dim_;
+        local_centroids_[partition_ids_accessor[i]] =
+            vector<float>(centroid_ptr, centroid_ptr + dim_);
+    }
+}
+
+bool PartitionManager::get_partition_centroid(int64_t partition_id, float* centroid_out) const {
+    if (parent_ != nullptr) {
+        return parent_->partition_manager_->partition_store_->get_vector_for_id(partition_id, centroid_out);
+    }
+
+    auto it = local_centroids_.find(partition_id);
+    if (it == local_centroids_.end()) {
+        return false;
+    }
+    std::memcpy(centroid_out, it->second.data(), static_cast<size_t>(dim_) * sizeof(float));
+    return true;
 }
 
 void PartitionManager::init_partitions(
@@ -41,7 +74,7 @@ void PartitionManager::init_partitions(
     parent_ = parent;
     int64_t nlist = clustering->nlist();
     int64_t ntotal = clustering->ntotal();
-    int64_t dim = clustering->dim();
+    dim_ = clustering->dim();
 
     if (nlist <= 0 && ntotal <= 0) {
         throw runtime_error("[PartitionManager] init_partitions: nlist and ntotal is <= 0.");
@@ -53,16 +86,28 @@ void PartitionManager::init_partitions(
             "[PartitionManager] init_partitions: parent's ntotal does not match partition_ids.size(0).");
     }
 
+    if (representation_ == nullptr) {
+        representation_ = std::make_shared<Fp32PartitionRepresentation>(dim_);
+    } else if (representation_->dim() != dim_) {
+        throw runtime_error("[PartitionManager] init_partitions: representation dim mismatch.");
+    }
+
     // Create the local partition_store_:
-    size_t code_size_bytes = static_cast<size_t>(dim * sizeof(float));
+    size_t code_size_bytes = static_cast<size_t>(representation_->code_size_bytes());
     partition_store_ = std::make_shared<faiss::DynamicInvertedLists>(
         0,
-        code_size_bytes
+        code_size_bytes,
+        dim_
     );
 
     // Set partition ids as [0, 1, 2, ..., nlist-1]
     clustering->partition_ids = torch::arange(nlist, torch::kInt64);
     curr_partition_id_ = nlist;
+    if (parent_ == nullptr) {
+        set_local_centroids(clustering);
+    } else {
+        clear_local_centroids();
+    }
 
     // Add an empty list for each partition ID
     auto partition_ids_accessor = clustering->partition_ids.accessor<int64_t, 1>();
@@ -101,11 +146,20 @@ void PartitionManager::init_partitions(
             }
 
             std::shared_ptr<IndexPartition> partition = partition_store_->get_partition(partition_ids_accessor[i]);
+            vector<uint8_t> encoded_codes(count * code_size_bytes);
+            const float* centroid_ptr = clustering->centroids.data_ptr<float>() + i * dim_;
+            const float* vector_ptr = v.data_ptr<float>();
+            for (size_t j = 0; j < count; ++j) {
+                representation_->encode(
+                    vector_ptr + static_cast<std::ptrdiff_t>(j) * dim_,
+                    centroid_ptr,
+                    encoded_codes.data() + j * code_size_bytes);
+            }
             partition_store_->add_entries(
                 partition_ids_accessor[i],
                 count,
                 id.data_ptr<int64_t>(),
-                as_uint8_ptr(v)
+                encoded_codes.data()
             );
             if (debug_) {
                 std::cout << "[PartitionManager] init_partitions: Added " << count
@@ -122,7 +176,7 @@ void PartitionManager::init_partitions(
 
     if (debug_) {
         std::cout << "[PartitionManager] init_partitions: Created " << nlist
-                  << " partitions, dimension=" << dim << std::endl;
+                  << " partitions, dimension=" << dim_ << std::endl;
     } else {
         std::cout << "[PartitionManager] init_partitions: Created " << nlist << " partitions." << std::endl;
     }
@@ -252,7 +306,9 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
     size_t code_size_bytes = partition_store_->code_size;
     auto id_ptr = vector_ids.data_ptr<int64_t>();
     auto id_accessor = vector_ids.accessor<int64_t, 1>();
-    const uint8_t *code_ptr = as_uint8_ptr(vectors);
+    const float* vector_ptr = vectors.data_ptr<float>();
+    vector<uint8_t> encoded_codes(static_cast<size_t>(n) * code_size_bytes);
+    vector<float> centroid_buffer(dim_);
 
     for (int64_t i = 0; i < n; i++) {
         int64_t pid = partition_ids_for_each[i];
@@ -268,11 +324,19 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
                       << " into partition " << pid << std::endl;
         }
 
+        if (!get_partition_centroid(pid, centroid_buffer.data())) {
+            std::fill(centroid_buffer.begin(), centroid_buffer.end(), 0.0f);
+        }
+        representation_->encode(
+            vector_ptr + static_cast<std::ptrdiff_t>(i) * dim_,
+            centroid_buffer.data(),
+            encoded_codes.data() + i * code_size_bytes);
+
         partition_store_->add_entries(
             pid,
             /*n_entry=*/1,
             id_ptr + i,
-            code_ptr + i * code_size_bytes,
+            encoded_codes.data() + i * code_size_bytes,
             record_delta
         );
     }
@@ -336,11 +400,30 @@ Tensor PartitionManager::get(const Tensor &ids) {
         std::cout << "[PartitionManager] get: Retrieving vectors for " << ids.size(0) << " ids." << std::endl;
     }
     auto ids_accessor = ids.accessor<int64_t, 1>();
-    Tensor vectors = torch::empty({ids.size(0), partition_store_->d_}, torch::kFloat32);
+    Tensor vectors = torch::empty({ids.size(0), dim_}, torch::kFloat32);
     auto vectors_ptr = vectors.data_ptr<float>();
+    vector<float> centroid_buffer(dim_);
+
+    if (partition_store_->id_to_location_.empty()) {
+        partition_store_->build_map();
+    }
 
     for (int64_t i = 0; i < ids.size(0); i++) {
-        partition_store_->get_vector_for_id(ids_accessor[i], vectors_ptr + i * partition_store_->d_);
+        auto it = partition_store_->id_to_location_.find(ids_accessor[i]);
+        if (it == partition_store_->id_to_location_.end()) {
+            throw runtime_error("[PartitionManager] get: vector ID not found.");
+        }
+
+        IndexPartition* part = it->second.first;
+        int64_t pos = it->second.second;
+        const uint8_t* code_ptr = part->codes_ + pos * part->code_size_;
+        if (!get_partition_centroid(part->partition_id_, centroid_buffer.data())) {
+            std::fill(centroid_buffer.begin(), centroid_buffer.end(), 0.0f);
+        }
+        representation_->reconstruct(
+            centroid_buffer.data(),
+            code_ptr,
+            vectors_ptr + i * dim_);
     }
     if (debug_) {
         std::cout << "[PartitionManager] get: Retrieval complete." << std::endl;
@@ -357,15 +440,20 @@ shared_ptr<Clustering> PartitionManager::select_partitions(const Tensor &select_
     if (debug_) {
         std::cout << "[PartitionManager] select_partitions: Selecting partitions from provided ids." << std::endl;
     }
-    Tensor centroids = parent_->get(select_ids);
+    Tensor centroids = torch::empty({select_ids.size(0), dim_}, torch::kFloat32);
+    auto centroids_ptr = centroids.data_ptr<float>();
     vector<Tensor> cluster_vectors;
     vector<Tensor> cluster_ids;
-    int d = (int) partition_store_->d_;
+    int d = dim_;
 
     auto selected_ids_accessor = select_ids.accessor<int64_t, 1>();
     for (int i = 0; i < select_ids.size(0); i++) {
         int64_t list_no = selected_ids_accessor[i];
         int64_t list_size = partition_store_->list_size(list_no);
+        float* centroid_ptr = centroids_ptr + static_cast<std::ptrdiff_t>(i) * d;
+        if (!get_partition_centroid(list_no, centroid_ptr)) {
+            std::fill(centroid_ptr, centroid_ptr + d, 0.0f);
+        }
         if (list_size == 0) {
             cluster_vectors.push_back(torch::empty({0, d}, torch::kFloat32));
             cluster_ids.push_back(torch::empty({0}, torch::kInt64));
@@ -376,10 +464,14 @@ shared_ptr<Clustering> PartitionManager::select_partitions(const Tensor &select_
         }
         auto codes = partition_store_->get_codes(list_no);
         auto ids = partition_store_->get_ids(list_no);
-        Tensor cluster_vectors_i = torch::from_blob((void *) codes, {list_size, d}, torch::kFloat32);
+        Tensor cluster_vectors_i = torch::empty({list_size, d}, torch::kFloat32);
+        representation_->reconstruct_batch_for_maintenance(
+            centroid_ptr,
+            codes,
+            static_cast<int>(list_size),
+            cluster_vectors_i.data_ptr<float>());
         Tensor cluster_ids_i = torch::from_blob((void *) ids, {list_size}, torch::kInt64);
         if (copy) {
-            cluster_vectors_i = cluster_vectors_i.clone();
             cluster_ids_i = cluster_ids_i.clone();
         }
         cluster_vectors.push_back(cluster_vectors_i);
@@ -410,7 +502,7 @@ shared_ptr<Clustering> PartitionManager::split_partitions(const Tensor &partitio
     int64_t num_partitions_to_split = partition_ids.size(0);
     int64_t num_splits = 2;
     int64_t total_new_partitions = num_partitions_to_split * num_splits;
-    int d = partition_store_->d_;
+    int d = dim_;
 
     Tensor split_centroids = torch::empty({total_new_partitions, d}, torch::kFloat32);
     vector<Tensor> split_vectors;
@@ -485,43 +577,71 @@ float PartitionManager::get_delete_factor(int64_t partition_id) {
 }
 
 int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_buffer) { 
-    // Load the specified partition 
-    const int dimension = partition_store_->d_;
-    std::shared_ptr<IndexPartition> curr_partition = partition_store_->get_partition(partition_id);    
+    const int dimension = dim_;
+    std::shared_ptr<IndexPartition> curr_partition =
+        partition_store_->get_partition(partition_id);
     int64_t delta_size = curr_partition->delta_count_;
-    if(delta_size == 0 || curr_partition->num_vectors_ == 0) { 
+    if (delta_size == 0 || curr_partition->num_vectors_ == 0) {
         curr_partition->reset_delta();
         return delta_size;
     }
-    
-    // Get the centroid for this partition
-    std::shared_ptr<faiss::DynamicInvertedLists> centroid_store = parent_->partition_manager_->partition_store_;
-    bool found_centroid = centroid_store->get_vector_for_id(partition_id, centroid_buffer);
-    if(!found_centroid) {
-        std::string err_msg = std::string("Failed to load centroid for partition ") + std::to_string(partition_id);
-        throw std::runtime_error(err_msg);
-    }
 
-    // Get the variables needed
     int64_t old_size = curr_partition->last_snapshot_size_;
     int64_t curr_size = curr_partition->num_vectors_;
-    if(old_size + delta_size != curr_size) { 
-        std::string err_msg = std::string("Invalid sizes for partition ") + std::to_string(partition_id);
+    if (old_size + delta_size != curr_size) {
+        std::string err_msg =
+            std::string("Invalid sizes for partition ") + std::to_string(partition_id);
         throw std::runtime_error(err_msg);
     }
 
-    // Update the centroid based on the delta
-    float* delta_vec = reinterpret_cast<float*>(curr_partition->delta_vec_);
-    #pragma unroll
-    for(int i = 0; i < dimension; i++) { 
-        float old_val = centroid_buffer[i];
-        centroid_buffer[i] = (old_size * centroid_buffer[i] + delta_vec[i])/curr_size;
+    vector<float> decode_centroid(dimension, 0.0f);
+    if (!get_partition_centroid(partition_id, decode_centroid.data())) {
+        std::fill(decode_centroid.begin(), decode_centroid.end(), 0.0f);
     }
 
-    // Write back the new centroid
-    centroid_store->write_vector_by_id(partition_id, centroid_buffer);
+    vector<float> decoded_vectors(static_cast<size_t>(curr_size) * dimension);
+    representation_->reconstruct_batch_for_maintenance(
+        decode_centroid.data(),
+        curr_partition->codes_,
+        static_cast<int>(curr_size),
+        decoded_vectors.data());
 
-    // Reset the delta as we have process this delta
+    std::fill(centroid_buffer, centroid_buffer + dimension, 0.0f);
+    for (int64_t i = 0; i < curr_size; ++i) {
+        const float* vector_ptr =
+            decoded_vectors.data() + static_cast<std::ptrdiff_t>(i) * dimension;
+        for (int j = 0; j < dimension; ++j) {
+            centroid_buffer[j] += vector_ptr[j];
+        }
+    }
+
+    const float inv_size = 1.0f / static_cast<float>(curr_size);
+    for (int j = 0; j < dimension; ++j) {
+        centroid_buffer[j] *= inv_size;
+    }
+
+    if (parent_ != nullptr && parent_->metric_ == faiss::METRIC_INNER_PRODUCT) {
+        float norm = 0.0f;
+        for (int j = 0; j < dimension; ++j) {
+            norm += centroid_buffer[j] * centroid_buffer[j];
+        }
+        norm = std::sqrt(norm);
+        if (norm > 0.0f) {
+            for (int j = 0; j < dimension; ++j) {
+                centroid_buffer[j] /= norm;
+            }
+        }
+    }
+
+    if (parent_ != nullptr) {
+        std::shared_ptr<faiss::DynamicInvertedLists> centroid_store =
+            parent_->partition_manager_->partition_store_;
+        centroid_store->write_vector_by_id(partition_id, centroid_buffer);
+    } else {
+        local_centroids_[partition_id] =
+            vector<float>(centroid_buffer, centroid_buffer + dimension);
+    }
+
     curr_partition->reset_delta();
     return delta_size;
 }
@@ -586,6 +706,8 @@ void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
     }
 
     auto p_ids_accessor = partitions->partition_ids.accessor<int64_t, 1>();
+    auto centroids_ptr = partitions->centroids.data_ptr<float>();
+    const size_t code_size_bytes = partition_store_->code_size;
     for (int64_t i = 0; i < nlist; i++) {
         int64_t list_no = p_ids_accessor[i];
         partition_store_->add_list(list_no);
@@ -593,11 +715,22 @@ void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
             set_partition_core_id(list_no, list_no % num_workers_);
         }
 
+        const int64_t count = partitions->vectors[i].size(0);
+        vector<uint8_t> encoded_codes(static_cast<size_t>(count) * code_size_bytes);
+        const float* vector_ptr = partitions->vectors[i].data_ptr<float>();
+        const float* centroid_ptr = centroids_ptr + i * dim_;
+        for (int64_t j = 0; j < count; ++j) {
+            representation_->encode(
+                vector_ptr + static_cast<std::ptrdiff_t>(j) * dim_,
+                centroid_ptr,
+                encoded_codes.data() + static_cast<size_t>(j) * code_size_bytes);
+        }
+
         partition_store_->add_entries(
             list_no,
-            partitions->vectors[i].size(0),
+            count,
             partitions->vector_ids[i].data_ptr<int64_t>(),
-            as_uint8_ptr(partitions->vectors[i])
+            encoded_codes.data()
         );
         partition_store_->get_partition(list_no)->reset_delta();
         if (debug_) {
@@ -654,11 +787,19 @@ void PartitionManager::distribute_partitions(int num_workers, bool use_numa) {
     num_workers_ = num_workers;
 
     if (parent_ == nullptr && partition_store_->nlist == 1) {
-        auto codes = (float *) partition_store_->get_codes(0);
-        auto ids = (int64_t *) partition_store_->get_ids(0);
         int64_t ntotal = partition_store_->list_size(0);
-        Tensor vectors = torch::from_blob(codes, {ntotal, d()}, torch::kFloat32);
-        Tensor vector_ids = torch::from_blob(ids, {ntotal}, torch::kInt64);
+        Tensor vectors = torch::empty({ntotal, d()}, torch::kFloat32);
+        vector<float> centroid_buffer(dim_);
+        const float* centroid_ptr = nullptr;
+        if (get_partition_centroid(0, centroid_buffer.data())) {
+            centroid_ptr = centroid_buffer.data();
+        }
+        representation_->reconstruct_batch_for_maintenance(
+            centroid_ptr,
+            partition_store_->get_codes(0),
+            static_cast<int>(ntotal),
+            vectors.data_ptr<float>());
+        Tensor vector_ids = torch::from_blob((void*) partition_store_->get_ids(0), {ntotal}, torch::kInt64).clone();
 
         Tensor partition_assignments = torch::randint(num_workers, {vectors.size(0)}, torch::kInt64);
         Tensor partition_ids = torch::arange(num_workers, torch::kInt64);
@@ -726,10 +867,58 @@ int64_t PartitionManager::nlist() const {
 }
 
 int PartitionManager::d() const {
-    if (!partition_store_) {
-        return 0;
+    return dim_;
+}
+
+int PartitionManager::code_size_bytes() const {
+    if (representation_ != nullptr) {
+        return representation_->code_size_bytes();
     }
-    return partition_store_->d_;
+    if (partition_store_ != nullptr) {
+        return static_cast<int>(partition_store_->code_size);
+    }
+    return 0;
+}
+
+void PartitionManager::scan_partition(const float* queries,
+                                      int nq,
+                                      int64_t partition_id,
+                                      vector<shared_ptr<TopkBuffer>>& topk_buffers,
+                                      MetricType metric,
+                                      const vector<std::atomic<float>*>& pivots,
+                                      float* ip_block,
+                                      float* norms_x,
+                                      float* norms_y,
+                                      int blas_db_bs,
+                                      int blas_q_bs) const {
+    auto codes = partition_store_->get_codes(partition_id);
+    auto ids = partition_store_->get_ids(partition_id);
+    int64_t list_size = partition_store_->list_size(partition_id);
+    if (list_size <= 0) {
+        return;
+    }
+
+    vector<float> centroid_buffer(dim_);
+    const float* centroid_ptr = nullptr;
+    if (get_partition_centroid(partition_id, centroid_buffer.data())) {
+        centroid_ptr = centroid_buffer.data();
+    }
+
+    representation_->scan_partition(
+        queries,
+        nq,
+        centroid_ptr,
+        codes,
+        ids,
+        list_size,
+        topk_buffers,
+        metric,
+        pivots,
+        ip_block,
+        norms_x,
+        norms_y,
+        blas_db_bs,
+        blas_q_bs);
 }
 
 Tensor PartitionManager::get_partition_ids() {
@@ -829,7 +1018,12 @@ void PartitionManager::load(const string &path) {
         partition_store_ = std::make_shared<faiss::DynamicInvertedLists>(0, 0);
     }
     partition_store_->load(path);
-    curr_partition_id_ = partition_store_->nlist;
+    dim_ = partition_store_->d_;
+    curr_partition_id_ = partition_store_->curr_list_id_;
+    if (representation_ == nullptr && dim_ > 0) {
+        representation_ = std::make_shared<Fp32PartitionRepresentation>(dim_);
+    }
+    clear_local_centroids();
 
     if (check_uniques_) {
         // add ids into resident set
