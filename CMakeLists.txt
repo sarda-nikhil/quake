@@ -16,6 +16,12 @@ if(QUAKE_USE_NUMA)
     add_compile_definitions(QUAKE_USE_NUMA)
 endif()
 
+option(QUAKE_USE_HSSI "Enable HSSI-backed Quake leaf representations" OFF)
+set(HSSI_ROOT "" CACHE PATH "Path to the HSSI repository root")
+if(QUAKE_USE_HSSI AND NOT HSSI_ROOT)
+    get_filename_component(HSSI_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." ABSOLUTE)
+endif()
+
 # C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -121,6 +127,38 @@ file(GLOB_RECURSE project_SOURCES ${project_SOURCE_DIR}/*.cpp)
 add_library(${PROJECT_NAME} SHARED ${project_SOURCES})
 set_target_properties(${PROJECT_NAME} PROPERTIES LINKER_LANGUAGE CXX)
 
+if(QUAKE_USE_HSSI)
+    if(NOT EXISTS "${HSSI_ROOT}/include/hssi/codec.h")
+        message(FATAL_ERROR "QUAKE_USE_HSSI=ON but HSSI_ROOT is invalid: ${HSSI_ROOT}")
+    endif()
+    add_library(hssi_core STATIC
+        ${HSSI_ROOT}/src/anchor_codec.cc
+        ${HSSI_ROOT}/src/cascade_codec.cc
+        ${HSSI_ROOT}/src/codec.cc
+        ${HSSI_ROOT}/src/codec_io.cc
+        ${HSSI_ROOT}/src/distance.cc
+        ${HSSI_ROOT}/src/factories_pq.cc
+        ${HSSI_ROOT}/src/factories_tq.cc
+        ${HSSI_ROOT}/src/fp32_codec.cc
+        ${HSSI_ROOT}/src/kmeans.cc
+        ${HSSI_ROOT}/src/pq.cc
+        ${HSSI_ROOT}/src/quantizer.cc
+        ${HSSI_ROOT}/src/turboquant.cc
+    )
+    set_target_properties(hssi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(hssi_core PUBLIC ${HSSI_ROOT}/include faiss)
+    target_compile_features(hssi_core PUBLIC cxx_std_17)
+    target_compile_definitions(${PROJECT_NAME} PUBLIC QUAKE_USE_HSSI)
+    find_library(OPENBLAS_LIBRARY openblas
+        PATHS /opt/homebrew/opt/openblas/lib /usr/local/lib /usr/lib)
+    if(OPENBLAS_LIBRARY)
+        target_link_libraries(hssi_core PUBLIC ${OPENBLAS_LIBRARY})
+    else()
+        target_link_libraries(hssi_core PUBLIC openblas)
+    endif()
+    target_link_libraries(hssi_core PUBLIC faiss)
+endif()
+
 target_include_directories(${PROJECT_NAME}
         PUBLIC
         ${TORCH_INCLUDE_DIRS}
@@ -128,6 +166,10 @@ target_include_directories(${PROJECT_NAME}
         ${project_THIRD_PARTY_DIR}/concurrentqueue/
         faiss
 )
+
+if(QUAKE_USE_HSSI)
+    target_include_directories(${PROJECT_NAME} PUBLIC ${HSSI_ROOT}/include)
+endif()
 
 target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
@@ -165,6 +207,9 @@ else()
 endif()
 
 target_link_libraries(${PROJECT_NAME} PUBLIC ${LINK_LIBS})
+if(QUAKE_USE_HSSI)
+    target_link_libraries(${PROJECT_NAME} PUBLIC hssi_core)
+endif()
 
 IF(QUAKE_USE_TSAN)
     message("Using thread sanitizer")

@@ -1018,10 +1018,14 @@ void PartitionManager::load(const string &path) {
         partition_store_ = std::make_shared<faiss::DynamicInvertedLists>(0, 0);
     }
     partition_store_->load(path);
-    dim_ = partition_store_->d_;
+    dim_ = representation_ != nullptr ? representation_->dim() : partition_store_->d_;
     curr_partition_id_ = partition_store_->curr_list_id_;
     if (representation_ == nullptr && dim_ > 0) {
         representation_ = std::make_shared<Fp32PartitionRepresentation>(dim_);
+    } else if (representation_ != nullptr &&
+               partition_store_->code_size !=
+                   static_cast<size_t>(representation_->code_size_bytes())) {
+        throw runtime_error("[PartitionManager] load: stored code size does not match representation.");
     }
     clear_local_centroids();
 

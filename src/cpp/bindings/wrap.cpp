@@ -9,6 +9,7 @@
 
 #include "common.h"
 #include <quake_index.h>
+#include <query_coordinator.h>
 #include <pybind11/stl.h>
 #include <pybind11/embed.h>
 #include <pybind11/pybind11.h>
@@ -127,6 +128,8 @@ PYBIND11_MODULE(_bindings, m) {
              "Return the total number of vectors stored in the index.")
         .def("nlist", &QuakeIndex::nlist,
              "Return the number of partitions (lists) in the index.")
+        .def("code_size_bytes", &QuakeIndex::code_size_bytes,
+             "Return the stored payload size per vector in bytes.")
         .def_readonly("parent", &QuakeIndex::parent_,
             "Return the parent index over the centroids.")
         .def_readonly("current_level", &QuakeIndex::current_level_,
@@ -155,6 +158,10 @@ PYBIND11_MODULE(_bindings, m) {
              (std::string("Distance metric. default = ") + DEFAULT_METRIC).c_str())
         .def_readwrite("num_workers", &IndexBuildParams::num_workers,
              (std::string("Number of workers. default = ") + std::to_string(DEFAULT_NUM_WORKERS)).c_str())
+        .def_readwrite("representation", &IndexBuildParams::representation,
+             "Leaf representation: fp32, anchor_tq, anchor_pq, cascade_tq, or cascade_pq.")
+        .def_readwrite("hssi_codec_path", &IndexBuildParams::hssi_codec_path,
+             "Path to a persisted HSSI codec for non-fp32 leaf representations.")
         .def_readwrite("parent_params", &IndexBuildParams::parent_params,
              "Parameters for the parent index, if any.")
         .def_readwrite("num_merge_workers", &IndexBuildParams::num_merge_workers,
@@ -174,6 +181,7 @@ PYBIND11_MODULE(_bindings, m) {
             oss << "\"nlist\": " << p.nlist << ", ";
             oss << "\"niter\": " << p.niter << ", ";
             oss << "\"metric\": \"" << p.metric << "\", ";
+            oss << "\"representation\": \"" << p.representation << "\", ";
             oss << "\"num_workers\": " << p.num_workers;
             oss << "}";
             return oss.str();

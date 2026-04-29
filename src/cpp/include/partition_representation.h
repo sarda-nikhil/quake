@@ -7,6 +7,11 @@
 
 #include <common.h>
 
+#ifdef QUAKE_USE_HSSI
+#include "hssi/codec.h"
+#include "hssi/codec_io.h"
+#endif
+
 template<typename T, typename I>
 class TypedTopKBuffer;
 
@@ -134,5 +139,64 @@ private:
     int dim_;
     int code_size_bytes_;
 };
+
+#ifdef QUAKE_USE_HSSI
+/**
+ * @brief HSSI-backed leaf representation.
+ *
+ * Quake still owns centroids, partition membership, APS, and maintenance. This
+ * adapter only changes the per-vector payload bytes and delegates encode,
+ * scan, maintenance reconstruction, and re-encode to hssi::Codec.
+ */
+class HssiPartitionRepresentation : public PartitionRepresentation {
+public:
+    HssiPartitionRepresentation(
+        shared_ptr<const hssi::Codec> codec,
+        hssi::CodecReconstructionMode reconstruction_mode);
+
+    int dim() const override;
+    int code_size_bytes() const override;
+    const char* kind() const override;
+
+    void encode(const float* vector,
+                const float* centroid,
+                uint8_t* code_out) const override;
+
+    void scan_partition(const float* queries,
+                        int nq,
+                        const float* centroid,
+                        const uint8_t* codes,
+                        const int64_t* ids,
+                        int64_t list_size,
+                        vector<shared_ptr<TopkBuffer>>& topk_buffers,
+                        MetricType metric,
+                        const vector<std::atomic<float>*>& pivots,
+                        float* ip_block,
+                        float* norms_x,
+                        float* norms_y,
+                        int blas_db_bs,
+                        int blas_q_bs) const override;
+
+    void reconstruct(const float* centroid,
+                     const uint8_t* code,
+                     float* vector_out) const override;
+
+    void batch_reencode(const uint8_t* codes,
+                        const uint32_t* assignments,
+                        const float* centroids,
+                        int num_partitions,
+                        int n,
+                        uint8_t* codes_out) const override;
+
+    void save(const string& path) const override;
+
+private:
+    shared_ptr<const hssi::Codec> codec_;
+    hssi::CodecReconstructionMode reconstruction_mode_;
+};
+
+shared_ptr<PartitionRepresentation> MakeHssiPartitionRepresentation(
+    const string& codec_path);
+#endif  // QUAKE_USE_HSSI
 
 #endif  // PARTITION_REPRESENTATION_H

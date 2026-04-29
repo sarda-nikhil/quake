@@ -9,6 +9,28 @@
 #include <fstream>
 #include <query_coordinator.h>
 
+namespace {
+
+shared_ptr<PartitionRepresentation> CreateLeafRepresentation(
+    const shared_ptr<IndexBuildParams>& build_params) {
+    if (build_params == nullptr || build_params->representation == "fp32") {
+        return nullptr;
+    }
+
+#ifdef QUAKE_USE_HSSI
+    if (build_params->hssi_codec_path.empty()) {
+        throw std::invalid_argument(
+            "HSSI representation requested but hssi_codec_path is empty");
+    }
+    return MakeHssiPartitionRepresentation(build_params->hssi_codec_path);
+#else
+    throw std::invalid_argument(
+        "HSSI representation requested but Quake was built without QUAKE_USE_HSSI");
+#endif
+}
+
+}  // namespace
+
 QuakeIndex::QuakeIndex(int current_level) {
     // Initialize the QuakeIndex
     parent_ = nullptr;
@@ -65,10 +87,13 @@ shared_ptr<BuildTimingInfo> QuakeIndex::build(Tensor x, Tensor ids, shared_ptr<I
             parent_build_params = build_params_->parent_params;
         }
         parent_build_params->metric = build_params_->metric;
+        parent_build_params->representation = "fp32";
+        parent_build_params->hssi_codec_path = "";
         parent_->build(clustering->centroids, clustering->partition_ids, parent_build_params);
 
         // initialize the partition manager
         partition_manager_ = make_shared<PartitionManager>();
+        partition_manager_->set_representation(CreateLeafRepresentation(build_params_));
         partition_manager_->init_partitions(parent_, clustering);
         auto e2 = std::chrono::high_resolution_clock::now();
         timing_info->assign_time_us = std::chrono::duration_cast<std::chrono::microseconds>(e2 - s2).count();
@@ -82,6 +107,7 @@ shared_ptr<BuildTimingInfo> QuakeIndex::build(Tensor x, Tensor ids, shared_ptr<I
         clustering->vectors = {x};
         clustering->vector_ids = {ids};
 
+        partition_manager_->set_representation(CreateLeafRepresentation(build_params_));
         partition_manager_->init_partitions(parent_, clustering);
     }
 
@@ -200,7 +226,7 @@ shared_ptr<MaintenanceTimingInfo> QuakeIndex::maintenance() {
 }
 
 bool QuakeIndex::validate() {
-    partition_manager_->validate();
+    return partition_manager_->validate();
 }
 
 
@@ -278,6 +304,7 @@ void QuakeIndex::load(const std::string& dir_path, shared_ptr<IndexBuildParams> 
     // 2. Create partition manager and load it
     {
         partition_manager_ = std::make_shared<PartitionManager>();
+        partition_manager_->set_representation(CreateLeafRepresentation(build_params));
         std::string partitions_path = (fs::path(dir_path) / "partitions").string();
         partition_manager_->load(partitions_path);
     }
@@ -334,4 +361,11 @@ int QuakeIndex::d() {
         return partition_manager_->d();
     }
     return 0;
+}
+
+int QuakeIndex::code_size_bytes() {
+    if (!partition_manager_) {
+        throw std::runtime_error("[QuakeIndex::code_size_bytes()] No partition manager. Index not built?");
+    }
+    return partition_manager_->code_size_bytes();
 }

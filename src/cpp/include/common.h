@@ -148,6 +148,8 @@ struct IndexBuildParams {
     int num_codebooks = -1;     // for PQ
     string metric = DEFAULT_METRIC;
     int niter = DEFAULT_NITER;
+    string representation = "fp32";  // fp32, anchor_tq, anchor_pq, cascade_tq, cascade_pq
+    string hssi_codec_path = "";     // persisted HSSI codec for non-FP32 leaf payloads
 
     bool use_adaptive_nprobe = false;
     bool use_numa = false;

@@ -142,6 +142,11 @@ public:
      * @return The dimensionality of the vectors.
      */
     int d();
+
+    /**
+     * @brief Get the stored payload size per vector in bytes.
+     */
+    int code_size_bytes();
 };
 
 #endif //QUAKE_INDEX_H
