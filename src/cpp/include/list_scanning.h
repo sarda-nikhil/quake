@@ -8,7 +8,9 @@
 #define LIST_SCANNING_H
 
 #include <common.h>
+#if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+#endif
 #include <chrono>
 
 #include "faiss/utils/Heap.h"
