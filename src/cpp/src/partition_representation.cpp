@@ -25,6 +25,27 @@ void PartitionRepresentation::reconstruct_batch_for_maintenance(
     }
 }
 
+void PartitionRepresentation::encode_batch(const float* vectors,
+                                           const float* centroids,
+                                           int n,
+                                           int centroid_stride,
+                                           uint8_t* codes_out) const {
+    if (n <= 0) {
+        return;
+    }
+    const std::ptrdiff_t dim_stride = dim();
+    const std::ptrdiff_t code_stride = code_size_bytes();
+    for (int i = 0; i < n; ++i) {
+        const float* centroid = centroids;
+        if (centroid_stride != 0) {
+            centroid = centroids + static_cast<std::ptrdiff_t>(i) * centroid_stride;
+        }
+        encode(vectors + static_cast<std::ptrdiff_t>(i) * dim_stride,
+               centroid,
+               codes_out + static_cast<std::ptrdiff_t>(i) * code_stride);
+    }
+}
+
 Fp32PartitionRepresentation::Fp32PartitionRepresentation(int dim)
     : dim_(dim),
       code_size_bytes_(dim * static_cast<int>(sizeof(float))) {
@@ -49,6 +70,19 @@ void Fp32PartitionRepresentation::encode(const float* vector,
                                          const float* /*centroid*/,
                                          uint8_t* code_out) const {
     std::memcpy(code_out, vector, static_cast<size_t>(code_size_bytes_));
+}
+
+void Fp32PartitionRepresentation::encode_batch(const float* vectors,
+                                               const float* /*centroids*/,
+                                               int n,
+                                               int /*centroid_stride*/,
+                                               uint8_t* codes_out) const {
+    if (n <= 0) {
+        return;
+    }
+    std::memcpy(codes_out,
+                vectors,
+                static_cast<size_t>(n) * static_cast<size_t>(code_size_bytes_));
 }
 
 void Fp32PartitionRepresentation::scan_partition(
@@ -159,6 +193,22 @@ void HssiPartitionRepresentation::encode(const float* vector,
                                          const float* centroid,
                                          uint8_t* code_out) const {
     codec_->Encode(vector, centroid, code_out);
+}
+
+void HssiPartitionRepresentation::encode_batch(const float* vectors,
+                                               const float* centroids,
+                                               int n,
+                                               int centroid_stride,
+                                               uint8_t* codes_out) const {
+    if (n <= 0) {
+        return;
+    }
+    if (centroid_stride == dim()) {
+        codec_->EncodeBatch(vectors, centroids, n, codes_out);
+        return;
+    }
+    PartitionRepresentation::encode_batch(vectors, centroids, n,
+                                          centroid_stride, codes_out);
 }
 
 void HssiPartitionRepresentation::scan_partition(

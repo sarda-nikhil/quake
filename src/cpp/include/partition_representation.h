@@ -40,6 +40,18 @@ public:
                         uint8_t* code_out) const = 0;
 
     /**
+     * @brief Encode a batch of vectors.
+     *
+     * `centroid_stride` is measured in floats. Use dim() for one centroid per
+     * vector, or 0 to reuse the first centroid for the whole batch.
+     */
+    virtual void encode_batch(const float* vectors,
+                              const float* centroids,
+                              int n,
+                              int centroid_stride,
+                              uint8_t* codes_out) const;
+
+    /**
      * @brief Scan a partition against one or more queries.
      *
      * The representation is responsible for interpreting the payload bytes and
@@ -107,6 +119,12 @@ public:
                 const float* centroid,
                 uint8_t* code_out) const override;
 
+    void encode_batch(const float* vectors,
+                      const float* centroids,
+                      int n,
+                      int centroid_stride,
+                      uint8_t* codes_out) const override;
+
     void scan_partition(const float* queries,
                         int nq,
                         const float* centroid,
@@ -161,6 +179,12 @@ public:
     void encode(const float* vector,
                 const float* centroid,
                 uint8_t* code_out) const override;
+
+    void encode_batch(const float* vectors,
+                      const float* centroids,
+                      int n,
+                      int centroid_stride,
+                      uint8_t* codes_out) const override;
 
     void scan_partition(const float* queries,
                         int nq,

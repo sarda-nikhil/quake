@@ -149,6 +149,11 @@ if(QUAKE_USE_HSSI)
     target_include_directories(hssi_core PUBLIC ${HSSI_ROOT}/include faiss)
     target_compile_features(hssi_core PUBLIC cxx_std_17)
     target_compile_definitions(${PROJECT_NAME} PUBLIC QUAKE_USE_HSSI)
+    # AVX2 flags for the fast-scan kernel in turboquant.cc. Gated on x86_64;
+    # the SIMD bodies are already #ifdef __AVX2__ guarded inside the source.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        target_compile_options(hssi_core PRIVATE -mavx2 -mfma -mbmi -mbmi2)
+    endif()
     find_library(OPENBLAS_LIBRARY openblas
         PATHS /opt/homebrew/opt/openblas/lib /usr/local/lib /usr/lib)
     if(OPENBLAS_LIBRARY)

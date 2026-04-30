@@ -72,7 +72,9 @@ class QuakeWrapper(IndexWrapper):
         use_gpu=False,
         use_numa=False,
         gpu_batch_size=100000,
-        gpu_sample_size=1000000
+        gpu_sample_size=1000000,
+        representation: str = "fp32",
+        hssi_codec_path: str = "",
     ):
         """
         Build the index with the given vectors and arguments.
@@ -97,6 +99,8 @@ class QuakeWrapper(IndexWrapper):
         build_params.num_workers = num_workers
         build_params.num_merge_workers = num_merge_workers
         build_params.use_numa = use_numa
+        build_params.representation = representation
+        build_params.hssi_codec_path = hssi_codec_path
 
         if parent is not None:
             build_params.parent_params = quake.IndexBuildParams()
@@ -215,6 +219,8 @@ class QuakeWrapper(IndexWrapper):
         num_merge_workers: int = 1,
         use_numa: bool = False,
         parent: dict = None,
+        representation: str = "fp32",
+        hssi_codec_path: str = "",
         verbose: bool = False,
     ):
         """
@@ -229,6 +235,8 @@ class QuakeWrapper(IndexWrapper):
         build_params = quake.IndexBuildParams()
         build_params.num_workers = num_workers
         build_params.use_numa = use_numa
+        build_params.representation = representation
+        build_params.hssi_codec_path = hssi_codec_path
         build_params.parent_params = quake.IndexBuildParams()
         if parent is not None:
             build_params.parent_params.num_workers = parent.get("num_workers", 0)

@@ -149,12 +149,12 @@ void PartitionManager::init_partitions(
             vector<uint8_t> encoded_codes(count * code_size_bytes);
             const float* centroid_ptr = clustering->centroids.data_ptr<float>() + i * dim_;
             const float* vector_ptr = v.data_ptr<float>();
-            for (size_t j = 0; j < count; ++j) {
-                representation_->encode(
-                    vector_ptr + static_cast<std::ptrdiff_t>(j) * dim_,
-                    centroid_ptr,
-                    encoded_codes.data() + j * code_size_bytes);
-            }
+            representation_->encode_batch(
+                vector_ptr,
+                centroid_ptr,
+                static_cast<int>(count),
+                /*centroid_stride=*/0,
+                encoded_codes.data());
             partition_store_->add_entries(
                 partition_ids_accessor[i],
                 count,
@@ -305,10 +305,13 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
     auto s3 = std::chrono::high_resolution_clock::now();
     size_t code_size_bytes = partition_store_->code_size;
     auto id_ptr = vector_ids.data_ptr<int64_t>();
-    auto id_accessor = vector_ids.accessor<int64_t, 1>();
     const float* vector_ptr = vectors.data_ptr<float>();
     vector<uint8_t> encoded_codes(static_cast<size_t>(n) * code_size_bytes);
-    vector<float> centroid_buffer(dim_);
+    vector<float> centroid_table(
+        static_cast<size_t>(curr_partition_id_) * static_cast<size_t>(dim_));
+    vector<uint8_t> centroid_valid(static_cast<size_t>(curr_partition_id_), 0);
+    vector<float> centroids_for_each(static_cast<size_t>(n) *
+                                     static_cast<size_t>(dim_));
 
     for (int64_t i = 0; i < n; i++) {
         int64_t pid = partition_ids_for_each[i];
@@ -320,23 +323,53 @@ shared_ptr<ModifyTimingInfo> PartitionManager::add(
         }
 
         if (debug_) {
-            std::cout << "[PartitionManager] add: Inserting vector " << i << " with id " << id_accessor[i]
+            std::cout << "[PartitionManager] add: Inserting vector " << i << " with id " << id_ptr[i]
                       << " into partition " << pid << std::endl;
         }
 
-        if (!get_partition_centroid(pid, centroid_buffer.data())) {
-            std::fill(centroid_buffer.begin(), centroid_buffer.end(), 0.0f);
+        float* centroid_ptr =
+            centroid_table.data() + static_cast<std::ptrdiff_t>(pid) * dim_;
+        if (!centroid_valid[static_cast<size_t>(pid)]) {
+            if (!get_partition_centroid(pid, centroid_ptr)) {
+                std::fill(centroid_ptr, centroid_ptr + dim_, 0.0f);
+            }
+            centroid_valid[static_cast<size_t>(pid)] = 1;
         }
-        representation_->encode(
-            vector_ptr + static_cast<std::ptrdiff_t>(i) * dim_,
-            centroid_buffer.data(),
-            encoded_codes.data() + i * code_size_bytes);
+        std::memcpy(centroids_for_each.data() + static_cast<std::ptrdiff_t>(i) * dim_,
+                    centroid_ptr,
+                    static_cast<size_t>(dim_) * sizeof(float));
+    }
 
+    representation_->encode_batch(
+        vector_ptr,
+        centroids_for_each.data(),
+        static_cast<int>(n),
+        /*centroid_stride=*/dim_,
+        encoded_codes.data());
+
+    std::unordered_map<int64_t, vector<int64_t>> positions_by_partition;
+    positions_by_partition.reserve(static_cast<size_t>(std::min<int64_t>(n, curr_partition_id_)));
+    for (int64_t i = 0; i < n; ++i) {
+        positions_by_partition[partition_ids_for_each[i]].push_back(i);
+    }
+
+    for (const auto& entry : positions_by_partition) {
+        const int64_t pid = entry.first;
+        const auto& positions = entry.second;
+        vector<int64_t> grouped_ids(positions.size());
+        vector<uint8_t> grouped_codes(positions.size() * code_size_bytes);
+        for (size_t j = 0; j < positions.size(); ++j) {
+            const int64_t pos = positions[j];
+            grouped_ids[j] = id_ptr[pos];
+            std::memcpy(grouped_codes.data() + j * code_size_bytes,
+                        encoded_codes.data() + static_cast<size_t>(pos) * code_size_bytes,
+                        code_size_bytes);
+        }
         partition_store_->add_entries(
             pid,
-            /*n_entry=*/1,
-            id_ptr + i,
-            encoded_codes.data() + i * code_size_bytes,
+            positions.size(),
+            grouped_ids.data(),
+            grouped_codes.data(),
             record_delta
         );
     }

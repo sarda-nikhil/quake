@@ -36,7 +36,7 @@ public:
     int64_t last_snapshot_size_ = 0; ///< The size since the last snapshot
     int64_t churn_count_ = 0; ///< Counter for the churn on this index
     int64_t delta_count_ = 0; ///< Counter of the delta that has happened since the last snapshot
-    uint8_t* delta_vec_ = nullptr; ///< Vector keeping track of the delta for this index
+    uint8_t* delta_vec_ = nullptr; ///< Deprecated; delta accounting is count-only.
 
     std::unordered_map<idx_t, int64_t> id_to_index_; ///< Map of vector ID to index
 

@@ -48,18 +48,15 @@ IndexPartition::~IndexPartition() {
     clear();
 }
 
-void IndexPartition::allocate_delta_buffer() { 
-    if(delta_vec_ == nullptr) { 
-        delta_vec_ = allocate_memory<uint8_t>(code_size_, numa_node_);
-    }
+void IndexPartition::allocate_delta_buffer() {
+    // Delta contents are intentionally not materialized. Maintenance only uses
+    // delta_count_/churn_count_, and centroid refresh reconstructs current
+    // partition contents through PartitionRepresentation.
 }
 
 void IndexPartition::reset_delta() { 
-    allocate_delta_buffer();
-
     last_snapshot_size_ = num_vectors_;
     delta_count_ = 0;
-    std::memset(delta_vec_, 0, code_size_ * sizeof(uint8_t));
 }
 
 void IndexPartition::set_code_size(int64_t code_size) {
@@ -75,20 +72,7 @@ void IndexPartition::set_code_size(int64_t code_size) {
 void IndexPartition::append(int64_t n_entry, const idx_t* new_ids, const uint8_t* new_codes, bool update_delta) {
     if (n_entry <= 0) return;
 
-    // Record the delta of the new vectors
     if(update_delta) { 
-        const int dimension = code_size_ / sizeof(float);
-        float* delta_values = reinterpret_cast<float*>(delta_vec_);
-        const float* new_values = reinterpret_cast<const float*>(new_codes);
-
-        for (int64_t i = 0; i < n_entry; i++) {
-            const float* inserted_vector = new_values + (i * dimension);
-
-            #pragma unroll
-            for (int j = 0; j < dimension; j++) {
-                delta_values[j] += inserted_vector[j];
-            }
-        }
         delta_count_ += n_entry;
     }
 
@@ -124,16 +108,7 @@ int64_t IndexPartition::remove(int64_t idx, bool update_delta)
         throw std::runtime_error("Index out of range in remove");
     }
 
-    // Update the delta to not include the removed vector
     if(update_delta) { 
-        const int dimension = code_size_ / sizeof(float);
-        float* delta_values = reinterpret_cast<float*>(delta_vec_);
-        float* vector_to_delete = reinterpret_cast<float*>(codes_) + (idx * dimension);
-
-        #pragma unroll
-        for (int j = 0; j < dimension; j++) {
-            delta_values[j] -= vector_to_delete[j];
-        }
         delta_count_ -= 1;
         churn_count_ += 1;
     }
@@ -174,6 +149,7 @@ void IndexPartition::clear() {
     code_size_ = 0;
     codes_ = nullptr;
     ids_ = nullptr;
+    delta_vec_ = nullptr;
 }
 
 void IndexPartition::check_buffer_size() { 
@@ -250,33 +226,51 @@ void IndexPartition::move_from(IndexPartition&& other) {
     code_size_ = other.code_size_;
     codes_ = other.codes_;
     ids_ = other.ids_;
+    last_snapshot_size_ = other.last_snapshot_size_;
+    churn_count_ = other.churn_count_;
+    delta_count_ = other.delta_count_;
+    delta_vec_ = other.delta_vec_;
 
     other.codes_ = nullptr;
     other.ids_ = nullptr;
+    other.delta_vec_ = nullptr;
     other.buffer_size_ = 0;
     other.num_vectors_ = 0;
     other.code_size_ = 0;
+    other.last_snapshot_size_ = 0;
+    other.churn_count_ = 0;
+    other.delta_count_ = 0;
 }
 
 void IndexPartition::free_memory() {
-    if (codes_ == nullptr && ids_ == nullptr) {
+    if (codes_ == nullptr && ids_ == nullptr && delta_vec_ == nullptr) {
         return;
     }
 #ifdef QUAKE_USE_NUMA
     if (numa_node_ == -1) {
         std::free(codes_);
         std::free(ids_);
+        std::free(delta_vec_);
     } else {
         const size_t code_bytes = static_cast<size_t>(code_size_);
-        numa_free(codes_, buffer_size_ * code_bytes);
-        numa_free(ids_, buffer_size_ * sizeof(idx_t));
+        if (codes_ != nullptr) {
+            numa_free(codes_, buffer_size_ * code_bytes);
+        }
+        if (ids_ != nullptr) {
+            numa_free(ids_, buffer_size_ * sizeof(idx_t));
+        }
+        if (delta_vec_ != nullptr) {
+            numa_free(delta_vec_, code_bytes);
+        }
     }
 #else
     std::free(codes_);
     std::free(ids_);
+    std::free(delta_vec_);
 #endif
     codes_ = nullptr;
     ids_ = nullptr;
+    delta_vec_ = nullptr;
 }
 
 void IndexPartition::reallocate_memory(int64_t new_capacity) {
