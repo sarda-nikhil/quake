@@ -12,6 +12,10 @@
 #include <query_coordinator.h>
 #include <topk_buffer.h>
 #include <omp.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 
 #ifdef QUAKE_ENABLE_GPU
 #include <c10/cuda/CUDAStream.h>
@@ -234,21 +238,37 @@ shared_ptr<Clustering> kmeans(Tensor vectors,
 tuple<Tensor, vector<shared_ptr<IndexPartition> >> kmeans_refine_partitions(
     Tensor centroids,
     vector<shared_ptr<IndexPartition>> &partitions,
+    shared_ptr<PartitionRepresentation> representation,
     MetricType metric,
     int refinement_iterations,
     int num_threads) {
-
-    size_t max_nq = 0;
-    for (auto &p : partitions) {
-        max_nq = std::max(max_nq, (size_t)p->num_vectors_);
+    if (representation == nullptr) {
+        throw std::invalid_argument("kmeans_refine_partitions: representation must be non-null");
     }
-    max_nq = max_nq * 10; // Ensure we allocate enough capacity
+
+    int64_t max_partition_vectors = 0;
+    for (auto &p : partitions) {
+        max_partition_vectors = std::max(max_partition_vectors, p->num_vectors_);
+    }
 
     // Determine number of clusters and dimension.
     int n_clusters = centroids.size(0);
     int d = centroids.size(1);
+    if (representation->dim() != d) {
+        throw std::runtime_error("kmeans_refine_partitions: representation dim mismatch");
+    }
 
-    vector<shared_ptr<TopkBuffer> > buffers = create_buffers(max_nq, 1, (metric == faiss::METRIC_INNER_PRODUCT), n_clusters);
+    // Maintenance refinement should not materialize an entire partition as
+    // FP32. Stream bounded chunks through reconstruction, assignment,
+    // centroid-stat accumulation, and re-encoding.
+    constexpr int64_t kRefineChunkVectors = 4096;
+    const int64_t chunk_capacity = std::max<int64_t>(
+        1, std::min<int64_t>(kRefineChunkVectors, max_partition_vectors));
+    vector<shared_ptr<TopkBuffer> > buffers = create_buffers(
+        static_cast<int>(chunk_capacity),
+        1,
+        (metric == faiss::METRIC_INNER_PRODUCT),
+        n_clusters);
 
 
     // Run for the desired number of iterations (if refinement_iterations==0, do one pass).
@@ -263,11 +283,29 @@ tuple<Tensor, vector<shared_ptr<IndexPartition> >> kmeans_refine_partitions(
 
     vector<shared_ptr<IndexPartition>> prev_partitions = partitions;
     vector<shared_ptr<IndexPartition>> new_partitions;
-    Fp32PartitionRepresentation representation(d);
+    Fp32PartitionRepresentation centroid_representation(d);
+    const int code_size = representation->code_size_bytes();
+    Tensor chunk_vectors = torch::empty({chunk_capacity, d}, torch::kFloat32);
+    float *chunk_vectors_ptr = chunk_vectors.data_ptr<float>();
+    vector<uint32_t> assignments(static_cast<size_t>(chunk_capacity));
+    vector<uint8_t> reencoded_codes(
+        static_cast<size_t>(chunk_capacity) * static_cast<size_t>(code_size));
 
     for (int iter = 0; iter < iterations; iter++) {
         if (iter > 0) {
-            centroids = centroid_sums / centroid_counts.unsqueeze(1).to(torch::kFloat32);
+            Tensor updated_centroids = centroids.clone();
+            auto updated_centroids_accessor = updated_centroids.accessor<float, 2>();
+            for (int c = 0; c < n_clusters; ++c) {
+                const int64_t count = centroid_counts_accessor[c];
+                if (count == 0) {
+                    continue;
+                }
+                for (int j = 0; j < d; ++j) {
+                    updated_centroids_accessor[c][j] =
+                        centroid_sums_accessor[c][j] / static_cast<float>(count);
+                }
+            }
+            centroids = updated_centroids;
 
             // normalize centroids if using inner product metric
             if (metric == faiss::METRIC_INNER_PRODUCT) {
@@ -286,54 +324,90 @@ tuple<Tensor, vector<shared_ptr<IndexPartition> >> kmeans_refine_partitions(
 
         for (int i = 0; i < n_clusters; i++) {
             new_partitions[i] = make_shared<IndexPartition>();
-            new_partitions[i]->set_code_size(partitions[0]->code_size_);
+            new_partitions[i]->set_code_size(code_size);
             new_partitions[i]->resize(10);
             new_partitions[i]->set_core_id(partitions[i]->core_id_);
         }
 
         float *centroids_ptr = centroids.data_ptr<float>();
 
-        for (auto &part: partitions) {
+        for (int part_idx = 0; part_idx < static_cast<int>(partitions.size()); ++part_idx) {
+            auto &part = partitions[part_idx];
             int64_t nvec = part->num_vectors_;
             if (nvec <= 0) continue;
 
-            float *part_vecs = (float *) part->codes_;
             int64_t *part_vec_ids = part->ids_;
+            const float *source_centroid =
+                centroids_ptr + static_cast<std::ptrdiff_t>(part_idx) * d;
 
-            representation.scan_partition(
-                part_vecs,
-                static_cast<int>(nvec),
-                nullptr,
-                reinterpret_cast<const uint8_t*>(centroids_ptr),
-                centroid_ids_ptr,
-                n_clusters,
-                buffers,
-                metric,
-                {},
-                nullptr,
-                nullptr,
-                nullptr,
-                BLAS_DB_BS,
-                static_cast<int>(nvec));
+            for (int64_t offset = 0; offset < nvec; offset += chunk_capacity) {
+                const int chunk_n = static_cast<int>(
+                    std::min<int64_t>(chunk_capacity, nvec - offset));
+                const uint8_t *chunk_codes =
+                    part->codes_ + static_cast<std::ptrdiff_t>(offset) * code_size;
+                int64_t *chunk_ids = part_vec_ids + offset;
 
-            // For each vector in this partition, determine its assignment.
-            for (int i = 0; i < nvec; i++) {
-                vector<int64_t> assign = buffers[i]->get_topk_indices(); // top1 assignment
-                int assigned_cluster = assign[0];
+                representation->reconstruct_batch_for_maintenance(
+                    source_centroid,
+                    chunk_codes,
+                    chunk_n,
+                    chunk_vectors_ptr);
 
-                // Update accumulators.
-                float *vec_ptr = part_vecs + i * d;
-                int64_t *vec_id = part_vec_ids + i;
+                centroid_representation.scan_partition(
+                    chunk_vectors_ptr,
+                    chunk_n,
+                    nullptr,
+                    reinterpret_cast<const uint8_t*>(centroids_ptr),
+                    centroid_ids_ptr,
+                    n_clusters,
+                    buffers,
+                    metric,
+                    {},
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    BLAS_DB_BS,
+                    chunk_n);
 
-                for (int j = 0; j < d; j++) {
-                    centroid_sums_accessor[assigned_cluster][j] += vec_ptr[j];
+                for (int i = 0; i < chunk_n; i++) {
+                    vector<int64_t> assign = buffers[i]->get_topk_indices();
+                    int assigned_cluster = part_idx;
+                    if (!assign.empty()) {
+                        assigned_cluster = static_cast<int>(assign[0]);
+                    }
+                    if (assigned_cluster < 0 || assigned_cluster >= n_clusters) {
+                        assigned_cluster = part_idx;
+                    }
+                    assignments[static_cast<size_t>(i)] =
+                        static_cast<uint32_t>(assigned_cluster);
+
+                    const float *vec_ptr =
+                        chunk_vectors_ptr + static_cast<std::ptrdiff_t>(i) * d;
+                    for (int j = 0; j < d; j++) {
+                        centroid_sums_accessor[assigned_cluster][j] += vec_ptr[j];
+                    }
+                    centroid_counts_accessor[assigned_cluster]++;
+                    buffers[i]->reset();
                 }
-                centroid_counts_accessor[assigned_cluster]++;
 
-                new_partitions[assigned_cluster]->append(1, vec_id, (uint8_t *) vec_ptr);
+                representation->batch_reencode(
+                    chunk_codes,
+                    assignments.data(),
+                    centroids_ptr,
+                    n_clusters,
+                    chunk_n,
+                    reencoded_codes.data());
 
-                // reset the buffer for this slot
-                buffers[i]->reset();
+                for (int i = 0; i < chunk_n; ++i) {
+                    const int assigned_cluster =
+                        static_cast<int>(assignments[static_cast<size_t>(i)]);
+                    new_partitions[assigned_cluster]->append(
+                        1,
+                        chunk_ids + i,
+                        reencoded_codes.data() +
+                            static_cast<size_t>(i) *
+                                static_cast<size_t>(code_size));
+                }
             }
         } // end for each partition
 

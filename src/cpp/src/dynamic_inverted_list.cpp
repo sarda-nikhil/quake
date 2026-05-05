@@ -375,6 +375,7 @@ void DynamicInvertedLists::batch_update_entries(
         IndexPartition* part = it->second.first;
         int64_t pos = it->second.second;
         std::memcpy(part->codes_ + pos * part->code_size_, reinterpret_cast<uint8_t*>(vector_values), part->code_size_);
+        ++part->mutation_version_;
     }
 
     vector<float*> DynamicInvertedLists::get_vectors_by_id(vector<int64_t> ids)

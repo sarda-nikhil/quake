@@ -10,6 +10,7 @@
 #include <common.h>
 
 class IndexPartition;
+class PartitionRepresentation;
 
 /**
  * @brief Clusters vectors into partitions using faiss::Clustering
@@ -68,6 +69,7 @@ shared_ptr<Clustering> kmeans(Tensor vectors,
  *
  * @param centroids  The current centroids as an IndexPartition.
  * @param index_partitions The current partitions.
+ * @param representation The payload representation used by the partitions.
  * @param metric The metric type to use for clustering.
  * @param refinement_iterations If 0, only reassign; otherwise, update centroids iteratively.
  *
@@ -76,6 +78,7 @@ shared_ptr<Clustering> kmeans(Tensor vectors,
 tuple<Tensor, vector<shared_ptr<IndexPartition>>> kmeans_refine_partitions(
     Tensor centroids,
     vector<shared_ptr<IndexPartition>> &index_partitions,
+    shared_ptr<PartitionRepresentation> representation,
     MetricType metric,
     int refinement_iterations = 0,
     int num_threads = -1);

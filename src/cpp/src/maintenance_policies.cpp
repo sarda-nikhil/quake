@@ -113,29 +113,61 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                     search_params->batched_scan = true;
                     search_params->track_hits = false;
                     Tensor single_partition = torch::tensor({partition_id}, torch::kInt64);
-                    shared_ptr<Clustering> selected_partition =
-                        partition_manager_->select_partitions(single_partition, true);
-                    Tensor part_vecs = selected_partition->vectors[0];
-                    auto res = partition_manager_->parent_->search(part_vecs, search_params);
+                    Tensor centroid_t = partition_manager_->parent_->get(single_partition);
+                    float* centroid = centroid_t.data_ptr<float>();
+                    auto partition =
+                        partition_manager_->partition_store_->get_partition(partition_id);
+                    unordered_map<int64_t, int64_t> reassign_count_map;
+                    constexpr int64_t kDeleteRejectChunkVectors = 4096;
+                    int64_t chunk_capacity = std::max<int64_t>(
+                        1, std::min<int64_t>(kDeleteRejectChunkVectors,
+                                             partition->num_vectors_));
+                    Tensor chunk_vectors = torch::empty(
+                        {chunk_capacity, partition_manager_->d()}, torch::kFloat32);
+                    const int code_size =
+                        partition_manager_->representation_->code_size_bytes();
+                    for (int64_t offset = 0; offset < partition->num_vectors_;
+                         offset += chunk_capacity) {
+                        int chunk_n = static_cast<int>(
+                            std::min<int64_t>(
+                                chunk_capacity, partition->num_vectors_ - offset));
+                        partition_manager_->representation_
+                            ->reconstruct_batch_for_maintenance(
+                                centroid,
+                                partition->codes_ + offset * code_size,
+                                chunk_n,
+                                chunk_vectors.data_ptr<float>());
+                        auto res = partition_manager_->parent_->search(
+                            chunk_vectors.narrow(0, 0, chunk_n), search_params);
+                        Tensor reassign_ids = res->ids.flatten();
+                        auto reassign_accessor =
+                            reassign_ids.accessor<int64_t, 1>();
+                        for (int64_t idx = 0; idx < reassign_ids.size(0); ++idx) {
+                            int64_t reassign_id = reassign_accessor[idx];
+                            if (reassign_id != partition_id && reassign_id >= 0) {
+                                reassign_count_map[reassign_id]++;
+                            }
+                        }
+                    }
 
-                    Tensor reassign_ids = res->ids.flatten();
+                    vector<int64_t> reassign_id_vec;
+                    vector<int64_t> reassign_counts;
+                    reassign_id_vec.reserve(reassign_count_map.size());
+                    reassign_counts.reserve(reassign_count_map.size());
+                    for (const auto& entry : reassign_count_map) {
+                        reassign_id_vec.push_back(entry.first);
+                        reassign_counts.push_back(entry.second);
+                    }
 
-                    // remove the partition itself
-                    reassign_ids = reassign_ids.masked_select(reassign_ids != partition_id);
-
-                    // Get A) the unique partitions, B) the number reassigned, C) the size of the partitions, D) hit rates of the partitions
-                    Tensor uniques;
-                    Tensor counts;
-                    std::tie(uniques, std::ignore, counts) = torch::_unique2(reassign_ids, true, false, true);
+                    Tensor uniques = torch::from_blob(
+                        reassign_id_vec.data(),
+                        {static_cast<int64_t>(reassign_id_vec.size())},
+                        torch::kInt64).clone();
                     Tensor part_sizes = partition_manager_->get_partition_sizes(uniques);
 
-                    // convert to vectors
-                    vector<int64_t> reassign_id_vec = vector<int64_t>(uniques.data_ptr<int64_t>(), uniques.data_ptr<int64_t>() + uniques.size(0));
-
-                    vector<int64_t> reassign_sizes = vector<int64_t>(part_sizes.data_ptr<int64_t>(),
-                                                                     part_sizes.data_ptr<int64_t>() + part_sizes.size(0));
-                    vector<int64_t> reassign_counts = vector<int64_t>(counts.data_ptr<int64_t>(),
-                                                                      counts.data_ptr<int64_t>() + counts.size(0));
+                    vector<int64_t> reassign_sizes = vector<int64_t>(
+                        part_sizes.data_ptr<int64_t>(),
+                        part_sizes.data_ptr<int64_t>() + part_sizes.size(0));
                     vector<float> hit_rates;
                     for (int64_t reassign_id: reassign_id_vec) {
                         hit_rates.push_back(static_cast<float>(aggregated_hits[reassign_id]) / static_cast<float>(params_->window_size));

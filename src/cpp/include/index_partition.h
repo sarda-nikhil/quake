@@ -8,6 +8,8 @@
 #define INDEX_PARTITION_H
 
 #include <common.h>
+#include <atomic>
+#include <cstdint>
 
 /**
  * @brief Represents a partition (sub-index) of encoded vectors.
@@ -21,6 +23,7 @@ public:
     // Static field for all index partitions
     static float delete_resize_threshold_;
     static float capacity_resize_threshold_;
+    static std::atomic<uint64_t> next_storage_generation_;
 
     int numa_node_ = -1;    ///< Assigned NUMA node (-1 if not set)
     int core_id_ = -1;    ///< Mapped thread ID for processing
@@ -29,6 +32,9 @@ public:
     int64_t num_vectors_ = 0;   ///< Current number of stored vectors
     int64_t code_size_ = 0;     ///< Size of each code in bytes (must be set before adding vectors)
     int64_t partition_id_ = -1;
+    uint64_t storage_generation_ =
+        next_storage_generation_.fetch_add(1, std::memory_order_relaxed);
+    uint64_t mutation_version_ = 0;
 
     uint8_t* codes_ = nullptr;  ///< Pointer to the encoded vectors (raw memory block)
     idx_t* ids_ = nullptr;      ///< Pointer to the vector IDs

@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <cassert>
+#include <memory>
 #include <mutex>
 #include <atomic>
 #include <utility>
@@ -53,6 +54,8 @@ using std::chrono::nanoseconds;
 using std::chrono::microseconds;
 using std::chrono::milliseconds;
 using faiss::idx_t;
+
+class IndexPartition;
 using faiss::MetricType;
 
 struct _EnsureSingleOmp {
@@ -87,6 +90,7 @@ constexpr float DEFAULT_RECALL_TARGET = -1.0f;           ///< Default recall tar
 constexpr bool DEFAULT_BATCHED_SCAN = false;             ///< Default flag for batched scanning.
 constexpr bool DEFAULT_PRECOMPUTED = true;               ///< Default flag to use precomputed incomplete beta fn for APS.
 constexpr float DEFAULT_INITIAL_SEARCH_FRACTION = 0.1f; ///< Default initial fraction of partitions to search.
+constexpr float DEFAULT_ADAPTIVE_NPROBE_MULTIPLIER = 1.0f; ///< Multiplier applied to the APS-recommended scan count.
 constexpr float DEFAULT_RECOMPUTE_THRESHOLD = 0.001f;    ///< Default threshold to trigger recomputation of search parameters.
 constexpr int DEFAULT_APS_FLUSH_PERIOD_US = 5;         ///< Default period (in microseconds) for flushing the APS buffer.
 constexpr int MAX_SUBBATCH = 128;
@@ -209,6 +213,7 @@ struct SearchParams {
     bool use_precomputed = DEFAULT_PRECOMPUTED;
     float recompute_threshold = DEFAULT_RECOMPUTE_THRESHOLD;
     float initial_search_fraction = DEFAULT_INITIAL_SEARCH_FRACTION;
+    float adaptive_nprobe_multiplier = DEFAULT_ADAPTIVE_NPROBE_MULTIPLIER;
     int aps_flush_period_us = DEFAULT_APS_FLUSH_PERIOD_US;
     int sample_prefix = 0;
     int sample_stride = 10;
@@ -245,11 +250,11 @@ struct BuildTimingInfo {
  * @brief Structure to hold timing information for modify (add/remove) operations.
  */
 struct ModifyTimingInfo {
-    int64_t n_vectors; ///< Number of vectors.
-    int input_validation_time_us; ///< Time spent on input validation in microseconds.
-    int find_partition_time_us; ///< Time spent on finding the partition for each vector in microseconds.
-    int modify_time_us; ///< Time spent on modify operations in microseconds.
-    int maintenance_time_us; ///< Time spent on maintenance operations in microseconds.
+    int64_t n_vectors = 0; ///< Number of vectors.
+    int input_validation_time_us = 0; ///< Time spent on input validation in microseconds.
+    int find_partition_time_us = 0; ///< Time spent on finding the partition for each vector in microseconds.
+    int modify_time_us = 0; ///< Time spent on modify operations in microseconds.
+    int maintenance_time_us = 0; ///< Time spent on maintenance operations in microseconds.
 };
 
 /**
@@ -322,8 +327,17 @@ struct Clustering {
     Tensor partition_ids;
     vector<Tensor> vectors;
     vector<Tensor> vector_ids;
+    vector<shared_ptr<IndexPartition>> encoded_partitions;
+    vector<int64_t> encoded_partition_sizes;
 
     int64_t ntotal() const {
+        if (!encoded_partitions.empty()) {
+            int64_t n = 0;
+            for (int64_t size : encoded_partition_sizes) {
+                n += size;
+            }
+            return n;
+        }
         int64_t n = 0;
         for (const auto &v : vectors) {
             if (v.defined() && v.numel() > 0) {
@@ -334,6 +348,9 @@ struct Clustering {
     }
 
     int64_t nlist() const {
+        if (!encoded_partitions.empty()) {
+            return encoded_partitions.size();
+        }
         return vectors.size();
     }
 
@@ -342,6 +359,9 @@ struct Clustering {
     }
 
     int64_t cluster_size(int64_t i) const {
+        if (!encoded_partitions.empty()) {
+            return encoded_partition_sizes[i];
+        }
         return vectors[i].size(0);
     }
 };

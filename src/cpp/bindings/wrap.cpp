@@ -204,6 +204,8 @@ PYBIND11_MODULE(_bindings, m) {
              (std::string("Flag to use precomputed inc beta fn for APS. default = ") + std::to_string(DEFAULT_PRECOMPUTED)).c_str())
         .def_readwrite("initial_search_fraction", &SearchParams::initial_search_fraction,
              (std::string("Initial fraction of partitions to search. default = ") + std::to_string(DEFAULT_INITIAL_SEARCH_FRACTION)).c_str())
+        .def_readwrite("adaptive_nprobe_multiplier", &SearchParams::adaptive_nprobe_multiplier,
+             (std::string("Multiplier applied to the APS-recommended scan count. default = ") + std::to_string(DEFAULT_ADAPTIVE_NPROBE_MULTIPLIER)).c_str())
         .def_readwrite("recompute_threshold", &SearchParams::recompute_threshold,
              (std::string("Threshold to trigger recomputation of APS. default = ") + std::to_string(DEFAULT_RECOMPUTE_THRESHOLD)).c_str())
         .def_readwrite("aps_flush_period_us", &SearchParams::aps_flush_period_us,
@@ -240,6 +242,7 @@ PYBIND11_MODULE(_bindings, m) {
             oss << "\"batched_scan\": " << (s.batched_scan ? "true" : "false") << ", ";
             oss << "\"use_precomputed\": " << (s.use_precomputed ? "true" : "false") << ", ";
             oss << "\"initial_search_fraction\": " << s.initial_search_fraction << ", ";
+            oss << "\"adaptive_nprobe_multiplier\": " << s.adaptive_nprobe_multiplier << ", ";
             oss << "\"recompute_threshold\": " << s.recompute_threshold << ", ";
             oss << "\"aps_flush_period_us\": " << s.aps_flush_period_us;
             oss << "}";

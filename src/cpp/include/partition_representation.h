@@ -6,6 +6,9 @@
 #define PARTITION_REPRESENTATION_H
 
 #include <common.h>
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
 
 #ifdef QUAKE_USE_HSSI
 #include "hssi/codec.h"
@@ -52,6 +55,17 @@ public:
                               uint8_t* codes_out) const;
 
     /**
+     * @brief Encode a batch with per-row centroid assignments into a dense
+     * centroid table. The default implementation loops encode().
+     */
+    virtual void encode_batch_assigned(const float* vectors,
+                                       const int64_t* centroid_assignments,
+                                       const float* centroids,
+                                       int num_centroids,
+                                       int n,
+                                       uint8_t* codes_out) const;
+
+    /**
      * @brief Scan a partition against one or more queries.
      *
      * The representation is responsible for interpreting the payload bytes and
@@ -70,7 +84,9 @@ public:
                                 float* norms_x,
                                 float* norms_y,
                                 int blas_db_bs,
-                                int blas_q_bs) const = 0;
+                                int blas_q_bs,
+                                uint64_t storage_key = 0,
+                                uint64_t storage_version = 0) const = 0;
 
     /**
      * @brief Reconstruct one payload into FP32 for get()/maintenance.
@@ -102,6 +118,8 @@ public:
                                 uint8_t* codes_out) const = 0;
 
     virtual void save(const string& path) const = 0;
+
+    virtual void invalidate_storage(uint64_t storage_key) const;
 };
 
 /**
@@ -124,6 +142,12 @@ public:
                       int n,
                       int centroid_stride,
                       uint8_t* codes_out) const override;
+    void encode_batch_assigned(const float* vectors,
+                               const int64_t* centroid_assignments,
+                               const float* centroids,
+                               int num_centroids,
+                               int n,
+                               uint8_t* codes_out) const override;
 
     void scan_partition(const float* queries,
                         int nq,
@@ -138,7 +162,9 @@ public:
                         float* norms_x,
                         float* norms_y,
                         int blas_db_bs,
-                        int blas_q_bs) const override;
+                        int blas_q_bs,
+                        uint64_t storage_key = 0,
+                        uint64_t storage_version = 0) const override;
 
     void reconstruct(const float* centroid,
                      const uint8_t* code,
@@ -185,6 +211,12 @@ public:
                       int n,
                       int centroid_stride,
                       uint8_t* codes_out) const override;
+    void encode_batch_assigned(const float* vectors,
+                               const int64_t* centroid_assignments,
+                               const float* centroids,
+                               int num_centroids,
+                               int n,
+                               uint8_t* codes_out) const override;
 
     void scan_partition(const float* queries,
                         int nq,
@@ -199,7 +231,9 @@ public:
                         float* norms_x,
                         float* norms_y,
                         int blas_db_bs,
-                        int blas_q_bs) const override;
+                        int blas_q_bs,
+                        uint64_t storage_key = 0,
+                        uint64_t storage_version = 0) const override;
 
     void reconstruct(const float* centroid,
                      const uint8_t* code,
@@ -213,10 +247,26 @@ public:
                         uint8_t* codes_out) const override;
 
     void save(const string& path) const override;
+    void invalidate_storage(uint64_t storage_key) const override;
 
 private:
+    struct ScanMajorCacheEntry {
+        uint64_t version = 0;
+        int64_t list_size = 0;
+        std::vector<uint8_t> bytes;
+    };
+
     shared_ptr<const hssi::Codec> codec_;
     hssi::CodecReconstructionMode reconstruction_mode_;
+    mutable std::mutex scan_major_cache_mutex_;
+    mutable std::unordered_map<uint64_t, std::shared_ptr<ScanMajorCacheEntry>>
+        scan_major_cache_;
+
+    std::shared_ptr<ScanMajorCacheEntry> get_scan_major_cache(
+        uint64_t storage_key,
+        uint64_t storage_version,
+        const uint8_t* codes,
+        int list_size) const;
 };
 
 shared_ptr<PartitionRepresentation> MakeHssiPartitionRepresentation(

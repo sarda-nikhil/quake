@@ -44,6 +44,31 @@ void PartitionRepresentation::encode_batch(const float* vectors,
         encode(vectors + static_cast<std::ptrdiff_t>(i) * dim_stride,
                centroid,
                codes_out + static_cast<std::ptrdiff_t>(i) * code_stride);
+  }
+}
+
+void PartitionRepresentation::encode_batch_assigned(
+    const float* vectors,
+    const int64_t* centroid_assignments,
+    const float* centroids,
+    int num_centroids,
+    int n,
+    uint8_t* codes_out) const {
+    if (n <= 0) {
+        return;
+    }
+    const std::ptrdiff_t dim_stride = dim();
+    const std::ptrdiff_t code_stride = code_size_bytes();
+    for (int i = 0; i < n; ++i) {
+        const int64_t centroid_id = centroid_assignments[i];
+        if (centroid_id < 0 || centroid_id >= num_centroids) {
+            throw std::out_of_range(
+                "PartitionRepresentation::encode_batch_assigned: "
+                "centroid assignment out of range");
+        }
+        encode(vectors + static_cast<std::ptrdiff_t>(i) * dim_stride,
+               centroids + static_cast<std::ptrdiff_t>(centroid_id) * dim_stride,
+               codes_out + static_cast<std::ptrdiff_t>(i) * code_stride);
     }
 }
 
@@ -86,6 +111,16 @@ void Fp32PartitionRepresentation::encode_batch(const float* vectors,
     std::memcpy(codes_out,
                 vectors,
                 static_cast<size_t>(n) * static_cast<size_t>(code_size_bytes_));
+}
+
+void Fp32PartitionRepresentation::encode_batch_assigned(
+    const float* vectors,
+    const int64_t* /*centroid_assignments*/,
+    const float* /*centroids*/,
+    int /*num_centroids*/,
+    int n,
+    uint8_t* codes_out) const {
+    encode_batch(vectors, nullptr, n, 0, codes_out);
 }
 
 void Fp32PartitionRepresentation::scan_partition(
@@ -213,25 +248,26 @@ void HssiPartitionRepresentation::encode_batch(const float* vectors,
         return;
     }
     if (centroid_stride == 0) {
-        // init_partitions passes stride=0 (one shared centroid for all n
-        // rows). Replicate so the SGEMM-amortized EncodeBatch path fires —
-        // otherwise the fallback walks NearestAnchor (1024 anchors x dim
-        // FMAs) per row, which dominates index build cost.
-        thread_local std::vector<float> replicated_centroids;
-        const int d = dim();
-        replicated_centroids.resize(static_cast<size_t>(n) * d);
-        for (int i = 0; i < n; ++i) {
-            std::memcpy(replicated_centroids.data() +
-                            static_cast<std::ptrdiff_t>(i) * d,
-                        centroids,
-                        static_cast<size_t>(d) * sizeof(float));
-        }
-        codec_->EncodeBatch(vectors, replicated_centroids.data(), n,
-                            codes_out);
+        codec_->EncodeBatchSharedCentroid(vectors, centroids, n, codes_out);
         return;
     }
     PartitionRepresentation::encode_batch(vectors, centroids, n,
                                           centroid_stride, codes_out);
+}
+
+void HssiPartitionRepresentation::encode_batch_assigned(
+    const float* vectors,
+    const int64_t* centroid_assignments,
+    const float* centroids,
+    int num_centroids,
+    int n,
+    uint8_t* codes_out) const {
+    if (n <= 0) {
+        return;
+    }
+    codec_->EncodeBatchAssignedCentroids(vectors, centroid_assignments,
+                                         centroids, num_centroids, n,
+                                         codes_out);
 }
 
 std::shared_ptr<HssiPartitionRepresentation::ScanMajorCacheEntry>

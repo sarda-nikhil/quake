@@ -23,6 +23,37 @@
 int QueryCoordinator::batch_scan_partition_chunk_size_ = BLAS_DB_BS;
 int QueryCoordinator::batch_scan_query_chunk_size_ = DEFAULT_BLAS_Q_BS;
 
+namespace {
+
+int aps_max_rank_for_target(const vector<float>& recall_profile,
+                            float recall_target,
+                            float multiplier,
+                            int num_partitions) {
+    if (num_partitions <= 0) {
+        return -1;
+    }
+
+    int recommended_rank = num_partitions - 1;
+    float cumulative_recall = 0.0f;
+    int profile_partitions = std::min(
+        num_partitions, static_cast<int>(recall_profile.size()));
+    for (int p = 0; p < profile_partitions; ++p) {
+        cumulative_recall += recall_profile[p];
+        if (cumulative_recall >= recall_target) {
+            recommended_rank = p;
+            break;
+        }
+    }
+
+    float effective_multiplier = std::max(1.0f, multiplier);
+    int scan_count = static_cast<int>(
+        std::ceil(static_cast<float>(recommended_rank + 1) * effective_multiplier));
+    scan_count = std::max(1, std::min(scan_count, num_partitions));
+    return scan_count - 1;
+}
+
+}  // namespace
+
 #ifdef __linux__
 // Wrapper for the system call since glibc doesn't provide one
 static long perf_event_open(struct perf_event_attr *hw_event, pid_t pid,
@@ -525,6 +556,12 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
     size_t cap = std::min(100 * K, 10000);
     int64_t queries_req = Q;
 
+    // Shrink only at 4x overshoot: bounds peak retention without thrashing on typical batch variation.
+    constexpr size_t kPoolShrinkRatio = 4;
+    if (res.topk_buffer_pool.size() > static_cast<size_t>(queries_req) * kPoolShrinkRatio) {
+        res.topk_buffer_pool.resize(queries_req);
+    }
+
     if (res.topk_buffer_pool.size() < (size_t)queries_req) {
         res.topk_buffer_pool.resize(queries_req);
         for (size_t i = 0; i < (size_t)queries_req; ++i) {
@@ -576,10 +613,13 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
         int qid = (*job.query_ids)[i];
         int qrank = (*job.ranks)[i];
 
-        // check that the job has not been processed yet
-        if (job_flags_[qid][qrank]) {
-            // already processed, skip
-            enqueue_result_job(ResultJob{qid, qrank, {}, {}});;
+        bool already_processed = job_flags_[qid][qrank].load(std::memory_order_relaxed);
+        bool query_done = query_done_flags_[qid].load(std::memory_order_relaxed);
+        bool past_adaptive_cutoff =
+            qrank > max_rank_[qid].load(std::memory_order_relaxed);
+
+        if (already_processed || query_done || past_adaptive_cutoff) {
+            enqueue_result_job(ResultJob{qid, qrank, {}, {}});
         } else {
             // copy query vector to the local buffer
             const float *src = nr.local_query_buffer + size_t(qid) * D;
@@ -588,6 +628,9 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
             ranks.push_back(qrank);
             offset += D;
         }
+    }
+    if (query_ids.empty()) {
+        return;
     }
     qptr = dst;
 
@@ -820,8 +863,7 @@ void QueryCoordinator::enqueue_scan_jobs(Tensor x,
                                          Tensor partition_ids,
                                          shared_ptr<SearchParams> params)
 {
-    int64_t nQ = x.size(0), D = x.size(1);
-    float *xptr = x.data_ptr<float>();
+    int64_t nQ = x.size(0);
 
     auto partition_ids_acc = partition_ids.accessor<int64_t,2>();
 
@@ -903,25 +945,14 @@ void QueryCoordinator::enqueue_scan_jobs(Tensor x,
             }
         }
     } else {
-        /* Build per-partition query lists -------------------------------------- */
-        std::unordered_map<int64_t, std::vector<std::pair<int,int>>> qlist;
-        for (int64_t q = 0; q < nQ; ++q) {
-            for (int p = 0; p < partition_ids.size(1); ++p) {
-                int64_t pid = pid_acc[q][p];
-                if (pid >= 0) qlist[pid].emplace_back(q, p);
-            }
-        }
-
         int nlist = partition_manager_->nlist();
         bool scan_all = false;
         if (nlist == 1) {
             scan_all = true;
         }
 
-        /* Emit ScanJobs, already split into ≤ params->batch_size chunks -------------- */
-        for (int64_t pid = 0; pid < (int64_t)qlist.size(); ++pid) {
-            auto &pairs = qlist[pid];
-            if (pairs.empty()) continue;
+        auto emit_scan_jobs = [&](int64_t pid, const std::vector<std::pair<int,int>>& pairs) {
+            if (pairs.empty()) return;
 
             for (size_t off = 0; off < pairs.size(); off += params->batch_size) {
                 size_t chunk = std::min<size_t>(params->batch_size, pairs.size() - off);
@@ -971,6 +1002,53 @@ void QueryCoordinator::enqueue_scan_jobs(Tensor x,
                     numa_resources_[node].job_queue.enqueue(next_job_id_);
                     next_job_id_++;
                     total_left_.fetch_add(chunk, std::memory_order_relaxed);
+                }
+            }
+        };
+
+        bool use_aps = (params->recall_target > 0 && parent_);
+        if (!use_aps) {
+            // Fixed-nprobe scans do not need rank-order adaptivity. Coalesce
+            // across all ranks by partition so each scan job sees enough
+            // queries to exercise representation-level batched kernels.
+            std::unordered_map<int64_t, std::vector<std::pair<int,int>>> qlist;
+            for (int p = 0; p < partition_ids.size(1); ++p) {
+                for (int64_t q = 0; q < nQ; ++q) {
+                    int64_t pid = pid_acc[q][p];
+                    if (pid >= 0) qlist[pid].emplace_back(q, p);
+                }
+            }
+
+            std::vector<int64_t> pids;
+            pids.reserve(qlist.size());
+            for (const auto& kv : qlist) {
+                pids.push_back(kv.first);
+            }
+            std::sort(pids.begin(), pids.end());
+
+            for (int64_t pid : pids) {
+                emit_scan_jobs(pid, qlist[pid]);
+            }
+        } else {
+            // Preserve APS semantics under batched_scan by emitting work in
+            // parent rank order. Grouping by partition across all ranks can
+            // scan far past the adaptive cutoff before APS lowers max_rank_.
+            for (int p = 0; p < partition_ids.size(1); ++p) {
+                std::unordered_map<int64_t, std::vector<std::pair<int,int>>> rank_qlist;
+                for (int64_t q = 0; q < nQ; ++q) {
+                    int64_t pid = pid_acc[q][p];
+                    if (pid >= 0) rank_qlist[pid].emplace_back(q, p);
+                }
+
+                std::vector<int64_t> pids;
+                pids.reserve(rank_qlist.size());
+                for (const auto& kv : rank_qlist) {
+                    pids.push_back(kv.first);
+                }
+                std::sort(pids.begin(), pids.end());
+
+                for (int64_t pid : pids) {
+                    emit_scan_jobs(pid, rank_qlist[pid]);
                 }
             }
         }
@@ -1052,29 +1130,27 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
 
                     if (recall_profile_set[q]) {
                         float recall_estimate = 0.0f;
-                        float sum = 0.0f;
-                        int max_rank = 0;
-
-                        for (int p = 0; p < partition_ids.size(1); ++p) {
-                            sum += recall_profiles[q][p];
-                            if (sum >= search_params->recall_target) {
-                                max_rank = p;
-                                break;
-                            }
-                        }
+                        int max_rank = aps_max_rank_for_target(
+                            recall_profiles[q],
+                            search_params->recall_target,
+                            search_params->adaptive_nprobe_multiplier,
+                            partition_ids.size(1));
                         max_rank_[q].store(max_rank, std::memory_order_relaxed);
 
-                        int n_scanned = 0;
                         float partition_recall_in_flight = 0.0f;
                         int count_in_flight = 0;
+                        auto recall_at_rank = [&](int p) {
+                            return p < static_cast<int>(recall_profiles[q].size())
+                                ? recall_profiles[q][p]
+                                : 0.0f;
+                        };
                         for (int p = 0; p < partition_ids.size(1); ++p) {
                             if (job_flags_[q][p].load(std::memory_order_relaxed)) {
-                                n_scanned++;
-                                recall_estimate += recall_profiles[q][p];
+                                recall_estimate += recall_at_rank(p);
                             } else {
                                 if (count_in_flight < num_workers_) {
                                     count_in_flight++;
-                                    partition_recall_in_flight += recall_profiles[q][p];
+                                    partition_recall_in_flight += recall_at_rank(p);
                                 }
 
                             }
@@ -1083,7 +1159,8 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
                         // add the in-flight recall to the estimate
                         recall_estimate += partition_recall_in_flight;
 
-                        if (recall_estimate >= search_params->recall_target) {
+                        if (search_params->adaptive_nprobe_multiplier <= 1.0f &&
+                            recall_estimate >= search_params->recall_target) {
                             query_done_flags_[q].store(true, std::memory_order_relaxed);
                         }
                     }
@@ -1096,19 +1173,19 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
 
     }
 
-    if (search_params->track_hits && maintenance_policy_) {
-        size_t partitions_per_query = partition_ids.size(1);
-        for (int64_t q = 0; q < nQ; ++q) {
-            std::vector<int64_t> scanned_ids;
-            scanned_ids.reserve(partitions_per_query);
-            for (int p = 0; p < partitions_per_query; ++p) {
-                if (job_flags_[q][p].load(std::memory_order_relaxed)) {
-                    int64_t pid = partition_ids[q][p].item<int64_t>();
-                    if (pid < 0) continue;
-                    scanned_ids.emplace_back(pid);
-                } 
+    size_t partitions_per_query = partition_ids.size(1);
+    for (int64_t q = 0; q < nQ; ++q) {
+        std::vector<int64_t> scanned_ids;
+        scanned_ids.reserve(partitions_per_query);
+        for (int p = 0; p < partitions_per_query; ++p) {
+            if (job_flags_[q][p].load(std::memory_order_relaxed)) {
+                int64_t pid = partition_ids[q][p].item<int64_t>();
+                if (pid < 0) continue;
+                scanned_ids.emplace_back(pid);
             }
-            timing->partitions_scanned += scanned_ids.size();
+        }
+        timing->partitions_scanned += scanned_ids.size();
+        if (search_params->track_hits && maintenance_policy_) {
             maintenance_policy_->record_query_hits(scanned_ids);
         }
     }
@@ -1483,6 +1560,7 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
     // Allocate per-query result vectors.
     vector<vector<float>> all_topk_dists(num_queries);
     vector<vector<int64_t>> all_topk_ids(num_queries);
+    vector<int> scanned_counts(num_queries, 0);
 
     // Use our custom parallel_for to process queries in parallel.
     parallel_for<int64_t>(0, num_queries, [&](int64_t q) {
@@ -1578,19 +1656,20 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
                                                                  metric_ == faiss::METRIC_L2);
                     }
                 }
-                float recall_estimate = 0.0;
-                for (int i = 0; i < p + 1; i++) {
-                    recall_estimate += partition_probs[i];
-                }
                 end_time = high_resolution_clock::now();
                 aps_time += duration_cast<nanoseconds>(end_time - start_time).count();
-                if (recall_estimate >= search_params->recall_target) {
+                int max_rank = aps_max_rank_for_target(
+                    partition_probs,
+                    search_params->recall_target,
+                    search_params->adaptive_nprobe_multiplier,
+                    num_parts);
+                if (p >= max_rank) {
                     break;
                 }
             }
         }
 
-        timing_info->partitions_scanned = scanned_ids.size();
+        scanned_counts[q] = static_cast<int>(scanned_ids.size());
 
         if (search_params->track_hits && maintenance_policy_) {
             if (debug_) std::cout << "[QueryCoordinator::serial_scan] record_query_hits being called with " << scanned_ids.size() << " ids" << std::endl;
@@ -1614,6 +1693,7 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
     auto ret_ids_accessor = ret_ids.accessor<int64_t, 2>();
     auto ret_dists_accessor = ret_dists.accessor<float, 2>();
     for (int64_t q = 0; q < num_queries; q++) {
+        timing_info->partitions_scanned += scanned_counts[q];
         int n_results = std::min((int)all_topk_dists[q].size(), k);
         for (int i = 0; i < n_results; i++) {
             ret_dists_accessor[q][i] = all_topk_dists[q][i];
@@ -1730,7 +1810,7 @@ shared_ptr<SearchResult> QueryCoordinator::scan_partitions(Tensor x, Tensor part
         if (debug_) std::cout << "[QueryCoordinator::scan_partitions] Using worker-based scan." << std::endl;
         return worker_scan(x, partition_ids, search_params);
     } else {
-        if (search_params->batched_scan) {
+        if (search_params->batched_scan && partition_ids.size(1) == 1) {
             if (debug_) std::cout << "[QueryCoordinator::scan_partitions] Using batched serial scan." << std::endl;
             return batched_serial_scan(x, partition_ids, search_params);
         } else {
@@ -1765,9 +1845,21 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
     int k = (search_params && search_params->k > 0) ? search_params->k : 1;
     int64_t d = partition_manager_->d();
     float* all_queries_ptr = x.data_ptr<float>();
+    timing_info->n_queries = num_queries;
+    timing_info->n_clusters = partition_manager_->nlist();
+    timing_info->search_params = search_params;
 
-    // Get the partition information
+    // This path uses one pid for all queries; reject heterogeneous partition_ids to avoid silently
+    // scanning query 0's partition for everyone.
     int64_t pid = partition_ids[0].item<int64_t>();
+    {
+        auto pid_acc = partition_ids.accessor<int64_t, 2>();
+        for (int q = 1; q < num_queries; ++q) {
+            if (pid_acc[q][0] != pid) {
+                return serial_scan(x, partition_ids, search_params);
+            }
+        }
+    }
     int64_t list_size = partition_manager_->partition_store_->list_size(pid);
 
     // Buffers for each query batch
@@ -1857,6 +1949,7 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
     // Aggregate the final results into output tensors.
     auto end = high_resolution_clock::now();
     timing_info->total_time_ns = duration_cast<nanoseconds>(end - start).count();
+    timing_info->partitions_scanned = num_queries;
 
     timing_info->worker_process_preamble_time_ns = job_setup_time;
     timing_info->worker_scan_time_ns = job_scan_time;

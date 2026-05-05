@@ -9,6 +9,7 @@
 // Initialize the static defaults
 float IndexPartition::delete_resize_threshold_ = 0.8;
 float IndexPartition::capacity_resize_threshold_ = 1.1;
+std::atomic<uint64_t> IndexPartition::next_storage_generation_{1};
 
 IndexPartition::IndexPartition(int64_t num_vectors,
                                uint8_t* codes,
@@ -82,6 +83,7 @@ void IndexPartition::append(int64_t n_entry, const idx_t* new_ids, const uint8_t
     std::memcpy(codes_ + num_vectors_ * code_bytes, new_codes, n_entry * code_bytes);
     std::memcpy(ids_ + num_vectors_, new_ids, n_entry * sizeof(idx_t));
     num_vectors_ += n_entry;
+    ++mutation_version_;
 
     //
     // // insert new ids into id_to_index_
@@ -100,6 +102,7 @@ void IndexPartition::update(int64_t offset, int64_t n_entry, const idx_t* new_id
     const size_t code_bytes = static_cast<size_t>(code_size_);
     std::memcpy(codes_ + offset * code_bytes, new_codes, n_entry * code_bytes);
     std::memcpy(ids_ + offset, new_ids, n_entry * sizeof(idx_t));
+    ++mutation_version_;
 }
 
 int64_t IndexPartition::remove(int64_t idx, bool update_delta)
@@ -122,6 +125,7 @@ int64_t IndexPartition::remove(int64_t idx, bool update_delta)
         ids_[idx] = ids_[last];
     }
     --num_vectors_;
+    ++mutation_version_;
     
     return (idx == last) ? -1 : idx;   // <‑‑ the new occupant of slot idx
 }
@@ -134,6 +138,7 @@ void IndexPartition::resize(int64_t new_capacity) {
         // Optionally log a warning about data loss
         // std::cerr << "Warning: Resizing to a smaller capacity will truncate data." << std::endl;
         num_vectors_ = new_capacity;
+        ++mutation_version_;
     }
     if (new_capacity != buffer_size_) {
         reallocate_memory(new_capacity);
@@ -230,6 +235,8 @@ void IndexPartition::move_from(IndexPartition&& other) {
     churn_count_ = other.churn_count_;
     delta_count_ = other.delta_count_;
     delta_vec_ = other.delta_vec_;
+    storage_generation_ = other.storage_generation_;
+    mutation_version_ = other.mutation_version_;
 
     other.codes_ = nullptr;
     other.ids_ = nullptr;
@@ -240,6 +247,7 @@ void IndexPartition::move_from(IndexPartition&& other) {
     other.last_snapshot_size_ = 0;
     other.churn_count_ = 0;
     other.delta_count_ = 0;
+    other.mutation_version_ = 0;
 }
 
 void IndexPartition::free_memory() {
