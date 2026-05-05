@@ -217,6 +217,10 @@ QueryCoordinator::~QueryCoordinator() {
     for (int idx = 0; idx < numa_resources_.size(); idx++) {
         auto &nr = numa_resources_[idx];
         if(nr.local_query_buffer != nullptr) quake_free(nr.local_query_buffer, nr.buffer_size);
+        if(nr.local_prepared_query_buffer != nullptr) {
+            quake_free(nr.local_prepared_query_buffer,
+                       nr.local_prepared_query_buffer_size);
+        }
     }
 
     // Free up global merger buffers
@@ -485,12 +489,25 @@ void QueryCoordinator::handle_nonbatched_job(const ScanJob &job,
 
         vector<shared_ptr<TopkBuffer>> active_buffers = {buf};
         vector<std::atomic<float>*> pivots = {&query_dist_pivots_[job.query_id]};
+        const void* prepared_q = nullptr;
+        if (nr.prepared_query_stride > 0 &&
+            nr.local_prepared_query_buffer != nullptr) {
+            prepared_q = nr.local_prepared_query_buffer +
+                         static_cast<size_t>(job.query_id) *
+                             nr.prepared_query_stride;
+        }
         partition_manager_->scan_partition(nr.local_query_buffer + (job.query_id * D),
                                            1,
                                            job.partition_id,
                                            active_buffers,
                                            metric_,
-                                           pivots);
+                                           pivots,
+                                           /*ip_block=*/nullptr,
+                                           /*norms_x=*/nullptr,
+                                           /*norms_y=*/nullptr,
+                                           BLAS_DB_BS,
+                                           DEFAULT_BLAS_Q_BS,
+                                           prepared_q);
 
         auto end = std::chrono::high_resolution_clock::now();
 
@@ -608,6 +625,15 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
     query_ids.reserve(Q);
     ranks.reserve(Q);
     int64_t offset = 0;
+    // Parallel gather of prepared-query rows so we can hand the codec a
+    // contiguous batch buffer (one row per gathered query, in the same
+    // order as `dst`). Empty stride => representation needs no prep.
+    thread_local std::vector<uint8_t> prepared_q_scratch;
+    const size_t prep_stride = nr.prepared_query_stride;
+    if (prep_stride > 0) {
+        prepared_q_scratch.resize(static_cast<size_t>(Q) * prep_stride);
+    }
+    size_t prep_offset = 0;
     for (int64_t i = 0; i < Q; ++i) {
 
         int qid = (*job.query_ids)[i];
@@ -624,6 +650,14 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
             // copy query vector to the local buffer
             const float *src = nr.local_query_buffer + size_t(qid) * D;
             std::memcpy(dst + offset, src, D * sizeof(float));
+            if (prep_stride > 0 &&
+                nr.local_prepared_query_buffer != nullptr) {
+                std::memcpy(prepared_q_scratch.data() + prep_offset,
+                            nr.local_prepared_query_buffer +
+                                static_cast<size_t>(qid) * prep_stride,
+                            prep_stride);
+                prep_offset += prep_stride;
+            }
             query_ids.push_back(qid);
             ranks.push_back(qrank);
             offset += D;
@@ -670,6 +704,10 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
     vector<shared_ptr<TopkBuffer>> active_buffers(
         res.topk_buffer_pool.begin(),
         res.topk_buffer_pool.begin() + static_cast<std::ptrdiff_t>(query_ids.size()));
+    const void* prepared_q_batch = nullptr;
+    if (prep_stride > 0) {
+        prepared_q_batch = prepared_q_scratch.data();
+    }
     partition_manager_->scan_partition(
         qptr,
         static_cast<int>(query_ids.size()),
@@ -681,7 +719,8 @@ void QueryCoordinator::handle_batched_job(const ScanJob &job,
         res.blas_norms_x,
         res.blas_norms_y,
         QueryCoordinator::batch_scan_partition_chunk_size_,
-        Q);
+        Q,
+        prepared_q_batch);
     
     if constexpr(RUN_WITH_HARDWARE_COUNTERS) {
         metrics_tracker->stop_and_record();
@@ -843,6 +882,16 @@ void QueryCoordinator::init_global_buffers(int64_t nQ,
 }
 
 void QueryCoordinator::copy_query_to_numa(const float *xptr, int64_t nQ, int64_t D) {
+    // Hoist any per-(query, partition) preparation work the active
+    // representation exposes (e.g. HSSI's PrepareQuery rotates the
+    // query). One call per query, regardless of fanout. Representations
+    // whose stride is 0 (fp32) skip this buffer entirely.
+    size_t prep_stride = 0;
+    if (partition_manager_ && partition_manager_->representation_) {
+        prep_stride = static_cast<size_t>(
+            partition_manager_->representation_->prepared_query_size_bytes());
+    }
+    const size_t prep_total = static_cast<size_t>(nQ) * prep_stride;
 
     for (int node = 0; node < get_num_numa_nodes(); ++node) {
         auto &nr = numa_resources_[node];
@@ -856,6 +905,24 @@ void QueryCoordinator::copy_query_to_numa(const float *xptr, int64_t nQ, int64_t
         std::memcpy(nr.local_query_buffer,
                     xptr,
                     size_t(nQ) * size_t(D) * sizeof(float));
+
+        if (prep_stride > 0) {
+            if (nr.local_prepared_query_buffer_size < prep_total) {
+                quake_free(nr.local_prepared_query_buffer,
+                           nr.local_prepared_query_buffer_size);
+                nr.local_prepared_query_buffer = static_cast<uint8_t*>(
+                    quake_alloc(prep_total, node));
+                nr.local_prepared_query_buffer_size = prep_total;
+            }
+            nr.prepared_query_stride = prep_stride;
+            for (int64_t q = 0; q < nQ; ++q) {
+                partition_manager_->representation_->prepare_query(
+                    xptr + q * D,
+                    nr.local_prepared_query_buffer + q * prep_stride);
+            }
+        } else {
+            nr.prepared_query_stride = 0;
+        }
     }
 }
 

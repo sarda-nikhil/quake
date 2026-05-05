@@ -74,6 +74,22 @@ void PartitionRepresentation::encode_batch_assigned(
 
 void PartitionRepresentation::invalidate_storage(uint64_t /*storage_key*/) const {}
 
+int PartitionRepresentation::prepared_centroid_size_bytes() const {
+    return 0;
+}
+
+int PartitionRepresentation::prepared_query_size_bytes() const {
+    return 0;
+}
+
+void PartitionRepresentation::prepare_centroid(const float* /*centroid*/,
+                                               void* /*prepared*/) const {
+}
+
+void PartitionRepresentation::prepare_query(const float* /*query*/,
+                                            void* /*prepared*/) const {
+}
+
 Fp32PartitionRepresentation::Fp32PartitionRepresentation(int dim)
     : dim_(dim),
       code_size_bytes_(dim * static_cast<int>(sizeof(float))) {
@@ -139,13 +155,14 @@ void Fp32PartitionRepresentation::scan_partition(
     int blas_db_bs,
     int blas_q_bs,
     uint64_t /*storage_key*/,
-    uint64_t /*storage_version*/) const {
+    uint64_t /*storage_version*/,
+    const void* /*prepared_queries*/,
+    const void* /*prepared_centroid*/) const {
     (void)ip_block;
     (void)norms_x;
     (void)norms_y;
     (void)blas_db_bs;
     (void)blas_q_bs;
-
     if (list_size <= 0 || nq <= 0 || codes == nullptr || ids == nullptr) {
         return;
     }
@@ -227,6 +244,24 @@ int HssiPartitionRepresentation::code_size_bytes() const {
 
 const char* HssiPartitionRepresentation::kind() const {
     return "hssi";
+}
+
+int HssiPartitionRepresentation::prepared_centroid_size_bytes() const {
+    return codec_->PreparedCentroidSizeBytes();
+}
+
+int HssiPartitionRepresentation::prepared_query_size_bytes() const {
+    return codec_->PreparedQuerySizeBytes();
+}
+
+void HssiPartitionRepresentation::prepare_centroid(const float* centroid,
+                                                   void* prepared) const {
+    codec_->PrepareCentroid(centroid, prepared);
+}
+
+void HssiPartitionRepresentation::prepare_query(const float* query,
+                                                void* prepared) const {
+    codec_->PrepareQuery(query, prepared);
 }
 
 void HssiPartitionRepresentation::encode(const float* vector,
@@ -322,7 +357,9 @@ void HssiPartitionRepresentation::scan_partition(
     int blas_db_bs,
     int blas_q_bs,
     uint64_t storage_key,
-    uint64_t storage_version) const {
+    uint64_t storage_version,
+    const void* prepared_queries,
+    const void* prepared_centroid) const {
     (void)ip_block;
     (void)norms_x;
     (void)norms_y;
@@ -356,26 +393,54 @@ void HssiPartitionRepresentation::scan_partition(
         }
     };
 
+    // Resolve prepared inputs. QueryCoordinator provides these on the search
+    // hot path; maintenance and tests may call the representation directly,
+    // so they prepare into thread-local scratch here.
+    const int prep_c_bytes = codec_->PreparedCentroidSizeBytes();
+    const int prep_q_bytes = codec_->PreparedQuerySizeBytes();
+
+    thread_local std::vector<uint8_t> prepared_centroid_scratch;
+    thread_local std::vector<uint8_t> prepared_queries_scratch;
+    const uint8_t* prep_c_ptr = nullptr;
+    if (prepared_centroid != nullptr) {
+        prep_c_ptr = static_cast<const uint8_t*>(prepared_centroid);
+    } else if (centroid != nullptr) {
+        prepared_centroid_scratch.resize(static_cast<size_t>(prep_c_bytes));
+        codec_->PrepareCentroid(centroid, prepared_centroid_scratch.data());
+        prep_c_ptr = prepared_centroid_scratch.data();
+    }
+
+    const uint8_t* prep_q_ptr = nullptr;
+    if (prepared_queries != nullptr) {
+        prep_q_ptr = static_cast<const uint8_t*>(prepared_queries);
+    } else {
+        prepared_queries_scratch.resize(
+            static_cast<size_t>(nq) * prep_q_bytes);
+        for (int qi = 0; qi < nq; ++qi) {
+            codec_->PrepareQuery(
+                queries + static_cast<std::ptrdiff_t>(qi) * dim(),
+                prepared_queries_scratch.data() +
+                    static_cast<std::ptrdiff_t>(qi) * prep_q_bytes);
+        }
+        prep_q_ptr = prepared_queries_scratch.data();
+    }
+
     if (nq == 1) {
         thread_local std::vector<float> distance_squares;
         distance_squares.resize(static_cast<size_t>(list_size));
         std::shared_ptr<ScanMajorCacheEntry> scan_cache =
             get_scan_major_cache(storage_key, storage_version, codes, scan_size);
-        if (scan_cache != nullptr) {
-            const int prep_c_bytes = codec_->PreparedCentroidSizeBytes();
-            const int prep_q_bytes = codec_->PreparedQuerySizeBytes();
-            thread_local std::vector<uint8_t> prepared_centroid_buf;
-            thread_local std::vector<uint8_t> prepared_query_buf;
-            prepared_centroid_buf.resize(static_cast<size_t>(prep_c_bytes));
-            prepared_query_buf.resize(static_cast<size_t>(prep_q_bytes));
-            codec_->PrepareCentroid(centroid, prepared_centroid_buf.data());
-            codec_->PrepareQuery(queries, prepared_query_buf.data());
+        if (scan_cache != nullptr && prep_c_ptr != nullptr) {
             codec_->ScanPartitionPreparedBatchScanMajor(
-                prepared_query_buf.data(),
+                prep_q_ptr,
                 1,
-                prepared_centroid_buf.data(),
+                prep_c_ptr,
                 scan_cache->bytes.data(),
                 scan_size,
+                distance_squares.data());
+        } else if (prep_c_ptr != nullptr) {
+            codec_->ScanPartitionPreparedBatch(
+                prep_q_ptr, 1, prep_c_ptr, codes, scan_size,
                 distance_squares.data());
         } else {
             codec_->ScanPartition(queries, centroid, codes, scan_size,
@@ -385,43 +450,54 @@ void HssiPartitionRepresentation::scan_partition(
         return;
     }
 
-    // Batched path: prepare centroid + queries once and pass the full query
-    // batch to the codec. For TQ-backed codecs, keep a versioned scan-major
-    // residual cache so search avoids repacking canonical strided codes while
-    // insert/delete/refine/split keep the maintenance-friendly layout.
-    const int prep_c_bytes = codec_->PreparedCentroidSizeBytes();
-    const int prep_q_bytes = codec_->PreparedQuerySizeBytes();
-
-    thread_local std::vector<uint8_t> prepared_centroid_buf;
-    thread_local std::vector<uint8_t> prepared_queries_buf;
-    thread_local std::vector<float> batched_dists;
-    prepared_centroid_buf.resize(static_cast<size_t>(prep_c_bytes));
-    prepared_queries_buf.resize(static_cast<size_t>(nq) * prep_q_bytes);
-    batched_dists.resize(static_cast<size_t>(nq) * list_size);
-
-    codec_->PrepareCentroid(centroid, prepared_centroid_buf.data());
-    for (int qi = 0; qi < nq; ++qi) {
-        codec_->PrepareQuery(
-            queries + static_cast<std::ptrdiff_t>(qi) * dim(),
-            prepared_queries_buf.data() +
-                static_cast<std::ptrdiff_t>(qi) * prep_q_bytes);
-    }
-
+    // Batched path. With a scan-major cache hit we use the FUSED hit
+    // API: kernel computes per-(q, blob) distance in SIMD, compares
+    // against the per-query pivot, and only emits hits for blobs that
+    // beat the pivot. Removes the dense distance-array write
+    // (nq × list_size floats) and the second-pass walk_dists. With a
+    // cache miss uses the dense scan + walk path.
     std::shared_ptr<ScanMajorCacheEntry> scan_cache =
         get_scan_major_cache(storage_key, storage_version, codes, scan_size);
+
+    if (scan_cache != nullptr && !pivots.empty()) {
+        thread_local std::vector<float> pivot_squares;
+        thread_local std::vector<hssi::ScanHit> hits;
+        pivot_squares.resize(static_cast<size_t>(nq));
+        for (int q = 0; q < nq; ++q) {
+            const float p = pivots[q]->load(std::memory_order_relaxed);
+            pivot_squares[q] = p * p;
+        }
+        // Worst-case capacity: every blob beats every pivot. In practice
+        // far fewer hits emit once the topk fills.
+        hits.resize(static_cast<size_t>(nq) * list_size);
+        int num_hits = 0;
+        codec_->ScanPartitionPreparedBatchScanMajorHits(
+            prep_q_ptr, nq, prep_c_ptr, pivot_squares.data(),
+            scan_cache->bytes.data(), scan_size,
+            hits.data(),
+            static_cast<int>(hits.size()),
+            &num_hits);
+        for (int h = 0; h < num_hits; ++h) {
+            const auto& hit = hits[h];
+            const float dist = hit.dist_sq <= 0.0f
+                ? 0.0f
+                : std::sqrt(hit.dist_sq);
+            topk_buffers[hit.query_idx]->add(dist, ids[hit.blob_idx]);
+        }
+        return;
+    }
+
+    thread_local std::vector<float> batched_dists;
+    batched_dists.resize(static_cast<size_t>(nq) * list_size);
     if (scan_cache != nullptr) {
         codec_->ScanPartitionPreparedBatchScanMajor(
-            prepared_queries_buf.data(),
-            nq,
-            prepared_centroid_buf.data(),
+            prep_q_ptr, nq, prep_c_ptr,
             scan_cache->bytes.data(),
             scan_size,
             batched_dists.data());
     } else {
         codec_->ScanPartitionPreparedBatch(
-            prepared_queries_buf.data(),
-            nq,
-            prepared_centroid_buf.data(),
+            prep_q_ptr, nq, prep_c_ptr,
             codes, scan_size,
             batched_dists.data());
     }

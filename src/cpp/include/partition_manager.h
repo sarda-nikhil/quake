@@ -99,7 +99,8 @@ public:
                         float* norms_x = nullptr,
                         float* norms_y = nullptr,
                         int blas_db_bs = BLAS_DB_BS,
-                        int blas_q_bs = DEFAULT_BLAS_Q_BS) const;
+                        int blas_q_bs = DEFAULT_BLAS_Q_BS,
+                        const void* prepared_queries = nullptr) const;
 
     /**
      * @brief Split a given partition into multiple smaller ones.
@@ -233,10 +234,34 @@ public:
      */
     void load(const string &path);
 
+    /**
+     * @brief Pointer into the prepared-centroid table for a given partition,
+     * or nullptr if no prepared payload is held for this partition (or the
+     * representation does not need preparation). The buffer is owned by the
+     * PartitionManager and refreshed on every centroid mutation.
+     */
+    const uint8_t* prepared_centroid_for(int64_t partition_id) const;
+
+    /**
+     * @brief Bytes per prepared centroid row for the active representation.
+     * Cached when the active representation is installed.
+     */
+    int prepared_centroid_size_bytes() const;
+
 private:
     unordered_map<int64_t, vector<float>> local_centroids_;
 
+    // Per-partition prepared-centroid bytes, indexed by partition_id.
+    // Populated by ensure_prepared_centroid() on every centroid mutation
+    // (init_partitions, update_centroid, add_partitions, refine, split).
+    // Empty entry means this representation does not use prepared centroids
+    // or this partition has not been prepared yet.
+    int prepared_centroid_size_bytes_ = 0;
+    mutable unordered_map<int64_t, vector<uint8_t>> prepared_centroids_;
+
     bool get_partition_centroid(int64_t partition_id, float* centroid_out) const;
+    void ensure_prepared_centroid(int64_t partition_id) const;
+    void drop_prepared_centroid(int64_t partition_id);
     void set_local_centroids(shared_ptr<Clustering> clustering);
     void clear_local_centroids();
 };

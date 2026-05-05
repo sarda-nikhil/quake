@@ -108,7 +108,16 @@ public:
 
     struct NUMAResources {
         float* local_query_buffer = nullptr;
-        void* metric_tracker_ptr; 
+        // Parallel buffer holding one prepared query row per query id, filled
+        // once in copy_query_to_numa. `prepared_query_stride` is bytes per
+        // row (== representation_->prepared_query_size_bytes()). Empty
+        // (nullptr / stride 0) when the representation does not need
+        // preparation (e.g. fp32) — in that case workers fall through to
+        // raw queries.
+        uint8_t* local_prepared_query_buffer = nullptr;
+        size_t local_prepared_query_buffer_size = 0;
+        size_t prepared_query_stride = 0;
+        void* metric_tracker_ptr;
 
         size_t buffer_size = 0;
         moodycamel::BlockingConcurrentQueue<int64_t> job_queue;

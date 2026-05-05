@@ -64,10 +64,46 @@ PartitionManager::~PartitionManager() {
 
 void PartitionManager::set_representation(shared_ptr<PartitionRepresentation> representation) {
     representation_ = representation;
+    prepared_centroids_.clear();
+    prepared_centroid_size_bytes_ = representation_ == nullptr
+        ? 0
+        : representation_->prepared_centroid_size_bytes();
 }
 
 void PartitionManager::clear_local_centroids() {
     local_centroids_.clear();
+    prepared_centroids_.clear();
+}
+
+int PartitionManager::prepared_centroid_size_bytes() const {
+    return prepared_centroid_size_bytes_;
+}
+
+const uint8_t* PartitionManager::prepared_centroid_for(int64_t partition_id) const {
+    auto it = prepared_centroids_.find(partition_id);
+    if (it == prepared_centroids_.end() || it->second.empty()) {
+        return nullptr;
+    }
+    return it->second.data();
+}
+
+void PartitionManager::ensure_prepared_centroid(int64_t partition_id) const {
+    const int prep_bytes = prepared_centroid_size_bytes();
+    if (prep_bytes <= 0 || representation_ == nullptr) {
+        return;
+    }
+    vector<float> centroid_buffer(static_cast<size_t>(dim_));
+    if (!get_partition_centroid(partition_id, centroid_buffer.data())) {
+        prepared_centroids_.erase(partition_id);
+        return;
+    }
+    auto& slot = prepared_centroids_[partition_id];
+    slot.resize(static_cast<size_t>(prep_bytes));
+    representation_->prepare_centroid(centroid_buffer.data(), slot.data());
+}
+
+void PartitionManager::drop_prepared_centroid(int64_t partition_id) {
+    prepared_centroids_.erase(partition_id);
 }
 
 void PartitionManager::set_local_centroids(shared_ptr<Clustering> clustering) {
@@ -127,6 +163,7 @@ void PartitionManager::init_partitions(
     } else if (representation_->dim() != dim_) {
         throw runtime_error("[PartitionManager] init_partitions: representation dim mismatch.");
     }
+    prepared_centroid_size_bytes_ = representation_->prepared_centroid_size_bytes();
 
     // Create the local partition_store_:
     size_t code_size_bytes = static_cast<size_t>(representation_->code_size_bytes());
@@ -209,6 +246,14 @@ void PartitionManager::init_partitions(
     }
 
     partition_store_->build_map();
+
+    // Pre-compute prepared centroid bytes for every partition so search
+    // can skip the per-(query, partition) PrepareCentroid call.
+    if (representation_ != nullptr && prepared_centroid_size_bytes() > 0) {
+        for (int64_t i = 0; i < clustering->partition_ids.size(0); ++i) {
+            ensure_prepared_centroid(partition_ids_accessor[i]);
+        }
+    }
 
     if (debug_) {
         std::cout << "[PartitionManager] init_partitions: Created " << nlist
@@ -815,6 +860,10 @@ int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_
             vector<float>(centroid_buffer, centroid_buffer + dimension);
     }
 
+    // Centroid moved — refresh the prepared bytes so the next search call
+    // streams the post-update rotation.
+    ensure_prepared_centroid(partition_id);
+
     curr_partition->reset_delta();
     return delta_size;
 }
@@ -865,6 +914,8 @@ void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {
         index_partitions[i]->partition_id_ = pids[i];
         partition_store_->partitions_[pids[i]] = index_partitions[i];
         index_partitions[i]->reset_delta();
+        // Centroid moved as part of refine — refresh prepared bytes.
+        ensure_prepared_centroid(pids[i]);
     }
 
     partition_store_->build_map();
@@ -914,6 +965,14 @@ void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
         }
 
         parent_->add(partitions->centroids, partitions->partition_ids);
+
+        // Refresh prepared centroid bytes for the encoded fast-path adds.
+        if (representation_ != nullptr && prepared_centroid_size_bytes() > 0) {
+            for (int64_t i = 0; i < nlist; i++) {
+                ensure_prepared_centroid(p_ids_accessor[i]);
+            }
+        }
+
         if (debug_) {
             std::cout << "[PartitionManager] add_partitions: Completed adding encoded partitions." << std::endl;
         }
@@ -952,6 +1011,14 @@ void PartitionManager::add_partitions(shared_ptr<Clustering> partitions) {
     }
 
     parent_->add(partitions->centroids, partitions->partition_ids);
+
+    // Refresh prepared centroid bytes for every newly added partition.
+    if (representation_ != nullptr && prepared_centroid_size_bytes() > 0) {
+        for (int64_t i = 0; i < nlist; i++) {
+            ensure_prepared_centroid(p_ids_accessor[i]);
+        }
+    }
+
     if (debug_) {
         std::cout << "[PartitionManager] add_partitions: Completed adding partitions." << std::endl;
     }
@@ -990,6 +1057,7 @@ void PartitionManager::delete_partitions(const Tensor &partition_ids, bool reass
                 }
             }
             partition_store_->remove_list(list_no);
+            drop_prepared_centroid(list_no);
             if (debug_) {
                 std::cout << "[PartitionManager] delete_partitions: Removed partition " << list_no << std::endl;
             }
@@ -1144,7 +1212,8 @@ void PartitionManager::scan_partition(const float* queries,
                                       float* norms_x,
                                       float* norms_y,
                                       int blas_db_bs,
-                                      int blas_q_bs) const {
+                                      int blas_q_bs,
+                                      const void* prepared_queries) const {
     std::shared_ptr<IndexPartition> partition =
         partition_store_->get_partition(partition_id);
     auto codes = partition->codes_;
@@ -1154,9 +1223,20 @@ void PartitionManager::scan_partition(const float* queries,
         return;
     }
 
+    // Pass precomputed prepared centroid bytes when available. If the
+    // representation does not use prepared centroids, or the slot is not
+    // populated yet after load, provide the raw centroid and let the
+    // representation prepare locally.
+    const uint8_t* prepared_centroid = prepared_centroid_for(partition_id);
+    if (prepared_centroid == nullptr && prepared_centroid_size_bytes() > 0) {
+        ensure_prepared_centroid(partition_id);
+        prepared_centroid = prepared_centroid_for(partition_id);
+    }
+
     vector<float> centroid_buffer(dim_);
     const float* centroid_ptr = nullptr;
-    if (get_partition_centroid(partition_id, centroid_buffer.data())) {
+    if (prepared_centroid == nullptr &&
+        get_partition_centroid(partition_id, centroid_buffer.data())) {
         centroid_ptr = centroid_buffer.data();
     }
 
@@ -1176,7 +1256,9 @@ void PartitionManager::scan_partition(const float* queries,
         blas_db_bs,
         blas_q_bs,
         partition->storage_generation_,
-        partition->mutation_version_);
+        partition->mutation_version_,
+        prepared_queries,
+        prepared_centroid);
 }
 
 Tensor PartitionManager::get_partition_ids() {
@@ -1285,6 +1367,9 @@ void PartitionManager::load(const string &path) {
                    static_cast<size_t>(representation_->code_size_bytes())) {
         throw runtime_error("[PartitionManager] load: stored code size does not match representation.");
     }
+    prepared_centroid_size_bytes_ = representation_ == nullptr
+        ? 0
+        : representation_->prepared_centroid_size_bytes();
     clear_local_centroids();
 
     if (check_uniques_) {

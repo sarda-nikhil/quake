@@ -66,10 +66,26 @@ public:
                                        uint8_t* codes_out) const;
 
     /**
+     * @brief Bytes occupied by one prepared centroid / query in a hoisted
+     * buffer. Default is 0: representations opt in only when preparation
+     * removes real per-scan work (e.g. HSSI rotates centroid/query).
+     */
+    virtual int prepared_centroid_size_bytes() const;
+    virtual int prepared_query_size_bytes() const;
+
+    /**
+     * @brief Populate the prepared form for a centroid / query.
+     */
+    virtual void prepare_centroid(const float* centroid, void* prepared) const;
+    virtual void prepare_query(const float* query, void* prepared) const;
+
+    /**
      * @brief Scan a partition against one or more queries.
      *
-     * The representation is responsible for interpreting the payload bytes and
-     * pushing results into the provided top-k buffers.
+     * `prepared_queries` (nq rows, stride `prepared_query_size_bytes()`) and
+     * `prepared_centroid` are owned by the caller and reused across many
+     * scan calls. They may be nullptr when the representation does not opt
+     * into preparation or when maintenance code scans outside QueryCoordinator.
      */
     virtual void scan_partition(const float* queries,
                                 int nq,
@@ -86,7 +102,9 @@ public:
                                 int blas_db_bs,
                                 int blas_q_bs,
                                 uint64_t storage_key = 0,
-                                uint64_t storage_version = 0) const = 0;
+                                uint64_t storage_version = 0,
+                                const void* prepared_queries = nullptr,
+                                const void* prepared_centroid = nullptr) const = 0;
 
     /**
      * @brief Reconstruct one payload into FP32 for get()/maintenance.
@@ -164,7 +182,9 @@ public:
                         int blas_db_bs,
                         int blas_q_bs,
                         uint64_t storage_key = 0,
-                        uint64_t storage_version = 0) const override;
+                        uint64_t storage_version = 0,
+                        const void* prepared_queries = nullptr,
+                        const void* prepared_centroid = nullptr) const override;
 
     void reconstruct(const float* centroid,
                      const uint8_t* code,
@@ -218,6 +238,11 @@ public:
                                int n,
                                uint8_t* codes_out) const override;
 
+    int prepared_centroid_size_bytes() const override;
+    int prepared_query_size_bytes() const override;
+    void prepare_centroid(const float* centroid, void* prepared) const override;
+    void prepare_query(const float* query, void* prepared) const override;
+
     void scan_partition(const float* queries,
                         int nq,
                         const float* centroid,
@@ -233,7 +258,9 @@ public:
                         int blas_db_bs,
                         int blas_q_bs,
                         uint64_t storage_key = 0,
-                        uint64_t storage_version = 0) const override;
+                        uint64_t storage_version = 0,
+                        const void* prepared_queries = nullptr,
+                        const void* prepared_centroid = nullptr) const override;
 
     void reconstruct(const float* centroid,
                      const uint8_t* code,
