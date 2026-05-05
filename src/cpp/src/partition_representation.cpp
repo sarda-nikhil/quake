@@ -243,23 +243,68 @@ void HssiPartitionRepresentation::scan_partition(
         throw std::invalid_argument("HSSI partition scan list_size exceeds int range");
     }
 
-    vector<float> distance_squares(static_cast<size_t>(list_size));
     const int scan_size = static_cast<int>(list_size);
-    for (int qi = 0; qi < nq; ++qi) {
-        const float* query_ptr = queries + static_cast<std::ptrdiff_t>(qi) * dim();
+
+    auto walk_dists = [&](int qi, const float* dist_row) {
         const float pivot = pivots.empty()
             ? std::numeric_limits<float>::infinity()
             : pivots[qi]->load(std::memory_order_relaxed);
         const float pivot_square = pivot * pivot;
-
-        codec_->ScanPartition(query_ptr, centroid, codes, scan_size,
-                              distance_squares.data());
         for (int64_t li = 0; li < list_size; ++li) {
-            const float dist_sq = distance_squares[static_cast<size_t>(li)];
+            const float dist_sq = dist_row[static_cast<size_t>(li)];
             if (dist_sq < pivot_square) {
                 const float dist = dist_sq <= 0.0f ? 0.0f : std::sqrt(dist_sq);
                 topk_buffers[qi]->add(dist, ids[li]);
             }
+        }
+    };
+
+    if (nq == 1) {
+        thread_local std::vector<float> distance_squares;
+        distance_squares.resize(static_cast<size_t>(list_size));
+        codec_->ScanPartition(queries, centroid, codes, scan_size,
+                              distance_squares.data());
+        walk_dists(0, distance_squares.data());
+        return;
+    }
+
+    // Batched path: pre-rotate centroid + queries once, then scan in
+    // chunks of kBatch queries through ScanPartitionPreparedBatch. This
+    // amortizes the partition's byte-major repack and the per-byte-plane
+    // code loads across the chunk. kBatch matches the codec's internal
+    // AVX2 fast-path width (TurboQuantCodec::kMaxBatchedQueries = 4).
+    constexpr int kBatch = 4;
+    const int prep_c_bytes = codec_->PreparedCentroidSizeBytes();
+    const int prep_q_bytes = codec_->PreparedQuerySizeBytes();
+
+    thread_local std::vector<uint8_t> prepared_centroid_buf;
+    thread_local std::vector<uint8_t> prepared_queries_buf;
+    thread_local std::vector<float> batched_dists;
+    prepared_centroid_buf.resize(static_cast<size_t>(prep_c_bytes));
+    prepared_queries_buf.resize(static_cast<size_t>(nq) * prep_q_bytes);
+    batched_dists.resize(static_cast<size_t>(kBatch) * list_size);
+
+    codec_->PrepareCentroid(centroid, prepared_centroid_buf.data());
+    for (int qi = 0; qi < nq; ++qi) {
+        codec_->PrepareQuery(
+            queries + static_cast<std::ptrdiff_t>(qi) * dim(),
+            prepared_queries_buf.data() +
+                static_cast<std::ptrdiff_t>(qi) * prep_q_bytes);
+    }
+
+    for (int q_start = 0; q_start < nq; q_start += kBatch) {
+        const int q_count = std::min(kBatch, nq - q_start);
+        codec_->ScanPartitionPreparedBatch(
+            prepared_queries_buf.data() +
+                static_cast<std::ptrdiff_t>(q_start) * prep_q_bytes,
+            q_count,
+            prepared_centroid_buf.data(),
+            codes, scan_size,
+            batched_dists.data());
+        for (int q = 0; q < q_count; ++q) {
+            walk_dists(q_start + q,
+                       batched_dists.data() +
+                           static_cast<std::ptrdiff_t>(q) * list_size);
         }
     }
 }
