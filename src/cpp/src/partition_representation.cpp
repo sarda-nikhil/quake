@@ -5,6 +5,7 @@
 #include <fstream>
 #include <limits>
 #include <cmath>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,8 @@ void PartitionRepresentation::encode_batch(const float* vectors,
                codes_out + static_cast<std::ptrdiff_t>(i) * code_stride);
     }
 }
+
+void PartitionRepresentation::invalidate_storage(uint64_t /*storage_key*/) const {}
 
 Fp32PartitionRepresentation::Fp32PartitionRepresentation(int dim)
     : dim_(dim),
@@ -99,7 +102,9 @@ void Fp32PartitionRepresentation::scan_partition(
     float* norms_x,
     float* norms_y,
     int blas_db_bs,
-    int blas_q_bs) const {
+    int blas_q_bs,
+    uint64_t /*storage_key*/,
+    uint64_t /*storage_version*/) const {
     (void)ip_block;
     (void)norms_x;
     (void)norms_y;
@@ -207,8 +212,62 @@ void HssiPartitionRepresentation::encode_batch(const float* vectors,
         codec_->EncodeBatch(vectors, centroids, n, codes_out);
         return;
     }
+    if (centroid_stride == 0) {
+        // init_partitions passes stride=0 (one shared centroid for all n
+        // rows). Replicate so the SGEMM-amortized EncodeBatch path fires —
+        // otherwise the fallback walks NearestAnchor (1024 anchors x dim
+        // FMAs) per row, which dominates index build cost.
+        thread_local std::vector<float> replicated_centroids;
+        const int d = dim();
+        replicated_centroids.resize(static_cast<size_t>(n) * d);
+        for (int i = 0; i < n; ++i) {
+            std::memcpy(replicated_centroids.data() +
+                            static_cast<std::ptrdiff_t>(i) * d,
+                        centroids,
+                        static_cast<size_t>(d) * sizeof(float));
+        }
+        codec_->EncodeBatch(vectors, replicated_centroids.data(), n,
+                            codes_out);
+        return;
+    }
     PartitionRepresentation::encode_batch(vectors, centroids, n,
                                           centroid_stride, codes_out);
+}
+
+std::shared_ptr<HssiPartitionRepresentation::ScanMajorCacheEntry>
+HssiPartitionRepresentation::get_scan_major_cache(
+    uint64_t storage_key,
+    uint64_t storage_version,
+    const uint8_t* codes,
+    int list_size) const {
+    if (storage_key == 0 || !codec_->SupportsScanMajor() || list_size < 8) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(scan_major_cache_mutex_);
+    auto it = scan_major_cache_.find(storage_key);
+    if (it != scan_major_cache_.end() &&
+        it->second->version == storage_version &&
+        it->second->list_size == list_size) {
+        return it->second;
+    }
+
+    auto entry = std::make_shared<ScanMajorCacheEntry>();
+    entry->version = storage_version;
+    entry->list_size = list_size;
+    entry->bytes.resize(static_cast<size_t>(
+        codec_->ScanMajorSizeBytes(list_size)));
+    codec_->BuildScanMajor(codes, list_size, entry->bytes.data());
+    scan_major_cache_[storage_key] = entry;
+    return entry;
+}
+
+void HssiPartitionRepresentation::invalidate_storage(uint64_t storage_key) const {
+    if (storage_key == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(scan_major_cache_mutex_);
+    scan_major_cache_.erase(storage_key);
 }
 
 void HssiPartitionRepresentation::scan_partition(
@@ -225,7 +284,9 @@ void HssiPartitionRepresentation::scan_partition(
     float* norms_x,
     float* norms_y,
     int blas_db_bs,
-    int blas_q_bs) const {
+    int blas_q_bs,
+    uint64_t storage_key,
+    uint64_t storage_version) const {
     (void)ip_block;
     (void)norms_x;
     (void)norms_y;
@@ -262,18 +323,36 @@ void HssiPartitionRepresentation::scan_partition(
     if (nq == 1) {
         thread_local std::vector<float> distance_squares;
         distance_squares.resize(static_cast<size_t>(list_size));
-        codec_->ScanPartition(queries, centroid, codes, scan_size,
-                              distance_squares.data());
+        std::shared_ptr<ScanMajorCacheEntry> scan_cache =
+            get_scan_major_cache(storage_key, storage_version, codes, scan_size);
+        if (scan_cache != nullptr) {
+            const int prep_c_bytes = codec_->PreparedCentroidSizeBytes();
+            const int prep_q_bytes = codec_->PreparedQuerySizeBytes();
+            thread_local std::vector<uint8_t> prepared_centroid_buf;
+            thread_local std::vector<uint8_t> prepared_query_buf;
+            prepared_centroid_buf.resize(static_cast<size_t>(prep_c_bytes));
+            prepared_query_buf.resize(static_cast<size_t>(prep_q_bytes));
+            codec_->PrepareCentroid(centroid, prepared_centroid_buf.data());
+            codec_->PrepareQuery(queries, prepared_query_buf.data());
+            codec_->ScanPartitionPreparedBatchScanMajor(
+                prepared_query_buf.data(),
+                1,
+                prepared_centroid_buf.data(),
+                scan_cache->bytes.data(),
+                scan_size,
+                distance_squares.data());
+        } else {
+            codec_->ScanPartition(queries, centroid, codes, scan_size,
+                                  distance_squares.data());
+        }
         walk_dists(0, distance_squares.data());
         return;
     }
 
-    // Batched path: pre-rotate centroid + queries once, then scan in
-    // chunks of kBatch queries through ScanPartitionPreparedBatch. This
-    // amortizes the partition's byte-major repack and the per-byte-plane
-    // code loads across the chunk. kBatch matches the codec's internal
-    // AVX2 fast-path width (TurboQuantCodec::kMaxBatchedQueries = 4).
-    constexpr int kBatch = 4;
+    // Batched path: prepare centroid + queries once and pass the full query
+    // batch to the codec. For TQ-backed codecs, keep a versioned scan-major
+    // residual cache so search avoids repacking canonical strided codes while
+    // insert/delete/refine/split keep the maintenance-friendly layout.
     const int prep_c_bytes = codec_->PreparedCentroidSizeBytes();
     const int prep_q_bytes = codec_->PreparedQuerySizeBytes();
 
@@ -282,7 +361,7 @@ void HssiPartitionRepresentation::scan_partition(
     thread_local std::vector<float> batched_dists;
     prepared_centroid_buf.resize(static_cast<size_t>(prep_c_bytes));
     prepared_queries_buf.resize(static_cast<size_t>(nq) * prep_q_bytes);
-    batched_dists.resize(static_cast<size_t>(kBatch) * list_size);
+    batched_dists.resize(static_cast<size_t>(nq) * list_size);
 
     codec_->PrepareCentroid(centroid, prepared_centroid_buf.data());
     for (int qi = 0; qi < nq; ++qi) {
@@ -292,20 +371,28 @@ void HssiPartitionRepresentation::scan_partition(
                 static_cast<std::ptrdiff_t>(qi) * prep_q_bytes);
     }
 
-    for (int q_start = 0; q_start < nq; q_start += kBatch) {
-        const int q_count = std::min(kBatch, nq - q_start);
+    std::shared_ptr<ScanMajorCacheEntry> scan_cache =
+        get_scan_major_cache(storage_key, storage_version, codes, scan_size);
+    if (scan_cache != nullptr) {
+        codec_->ScanPartitionPreparedBatchScanMajor(
+            prepared_queries_buf.data(),
+            nq,
+            prepared_centroid_buf.data(),
+            scan_cache->bytes.data(),
+            scan_size,
+            batched_dists.data());
+    } else {
         codec_->ScanPartitionPreparedBatch(
-            prepared_queries_buf.data() +
-                static_cast<std::ptrdiff_t>(q_start) * prep_q_bytes,
-            q_count,
+            prepared_queries_buf.data(),
+            nq,
             prepared_centroid_buf.data(),
             codes, scan_size,
             batched_dists.data());
-        for (int q = 0; q < q_count; ++q) {
-            walk_dists(q_start + q,
-                       batched_dists.data() +
-                           static_cast<std::ptrdiff_t>(q) * list_size);
-        }
+    }
+    for (int q = 0; q < nq; ++q) {
+        walk_dists(q,
+                   batched_dists.data() +
+                       static_cast<std::ptrdiff_t>(q) * list_size);
     }
 }
 
