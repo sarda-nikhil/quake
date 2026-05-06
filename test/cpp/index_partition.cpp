@@ -102,6 +102,8 @@ TEST_F(IndexPartitionTest, ParameterizedConstructorTest) {
     EXPECT_EQ(param_partition.code_size_, code_size);
     EXPECT_NE(param_partition.codes_, nullptr);
     EXPECT_NE(param_partition.ids_, nullptr);
+    EXPECT_EQ(param_partition.last_snapshot_size_, num_vectors);
+    EXPECT_EQ(param_partition.delta_count_, 0);
 
     // Verify initial data
     verify_ids(param_partition.ids_, ids, 0);

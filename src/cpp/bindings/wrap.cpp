@@ -278,6 +278,8 @@ PYBIND11_MODULE(_bindings, m) {
              (std::string("Delete threshold (ns). default = ") + std::to_string(DEFAULT_DELETE_THRESHOLD_NS)).c_str())
         .def_readwrite("split_threshold_ns", &MaintenancePolicyParams::split_threshold_ns,
              (std::string("Split threshold (ns). default = ") + std::to_string(DEFAULT_SPLIT_THRESHOLD_NS)).c_str())
+        .def_readwrite("max_splits_per_maintenance", &MaintenancePolicyParams::max_splits_per_maintenance,
+             "Maximum split decisions to execute in one maintenance round. -1 disables the cap.")
         .def("__repr__", [](const MaintenancePolicyParams &m) {
             std::ostringstream oss;
             oss << "{";
@@ -291,6 +293,7 @@ PYBIND11_MODULE(_bindings, m) {
             oss << "\"enable_delete_rejection\": " << (m.enable_delete_rejection ? "true" : "false") << ", ";
             oss << "\"delete_threshold_ns\": " << m.delete_threshold_ns << ", ";
             oss << "\"split_threshold_ns\": " << m.split_threshold_ns << ", ";
+            oss << "\"max_splits_per_maintenance\": " << m.max_splits_per_maintenance;
             oss << "}";
             return oss.str();
         });

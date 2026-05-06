@@ -25,10 +25,9 @@ IndexPartition::IndexPartition(int64_t num_vectors,
     last_snapshot_size_ = 0;
     delta_count_ = 0;
 
-    reset_delta();
-
     ensure_capacity(num_vectors);
     append(num_vectors, ids, codes);
+    reset_delta();
 }
 
 // Move Constructor

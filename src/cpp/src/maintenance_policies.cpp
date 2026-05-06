@@ -1,8 +1,10 @@
 #include "maintenance_policies.h"
 
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <numeric>
+#include <utility>
 #include <torch/torch.h>
 
 #include "quake_index.h"
@@ -41,8 +43,8 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
     }
 
     vector<int64_t> partitions_to_delete;
-    vector<int64_t> partitions_to_split;
     vector<int64_t> partitions_to_recluster;
+    vector<std::pair<int64_t, float>> split_candidates;
 
     Tensor all_partition_ids_tens = partition_manager_->get_partition_ids();
     vector<int64_t> all_partition_ids = vector<int64_t>(all_partition_ids_tens.data_ptr<int64_t>(),
@@ -55,7 +57,9 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
             int partition_size = partition_manager_->get_partition_size(partition_id);
 
             if (partition_size > params_->max_partition_size) {
-                partitions_to_split.emplace_back(partition_id);
+                split_candidates.emplace_back(
+                    partition_id,
+                    -static_cast<float>(partition_size));
             } else if (partition_size < params_->min_partition_size) {
                 partitions_to_delete.emplace_back(partition_id);
             }
@@ -196,7 +200,7 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                     bool should_split = split_delta < -params_->split_threshold_ns;
                     if constexpr(debug_) std::cout << "For partition " << partition_id << " of size " << partition_size << " got split delta " << split_delta << " leading to split decision of " << should_split << std::endl;
                     if (should_split) {
-                        partitions_to_split.push_back(partition_id);
+                        split_candidates.emplace_back(partition_id, split_delta);
                         choose_partition = true;
                     }
                 }
@@ -218,6 +222,22 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
         quake_free(new_centroids_buffer, partition_manager_->d() * sizeof(float));
     }
 
+
+    if (params_->max_splits_per_maintenance >= 0 &&
+        split_candidates.size() >
+            static_cast<size_t>(params_->max_splits_per_maintenance)) {
+        std::sort(split_candidates.begin(), split_candidates.end(),
+                  [](const auto& a, const auto& b) {
+                      return a.second < b.second;
+                  });
+        split_candidates.resize(
+            static_cast<size_t>(params_->max_splits_per_maintenance));
+    }
+    vector<int64_t> partitions_to_split;
+    partitions_to_split.reserve(split_candidates.size());
+    for (const auto& candidate : split_candidates) {
+        partitions_to_split.push_back(candidate.first);
+    }
 
     // Convert partition ID vectors to Torch tensors.
     Tensor partitions_to_delete_tens = torch::from_blob(

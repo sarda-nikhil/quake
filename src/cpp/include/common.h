@@ -132,6 +132,7 @@ struct MaintenancePolicyParams {
     float partition_reduction_threshold = DEFAULT_PARTITION_REDUCTION_THRESHOLD;
     float delete_threshold_ns = DEFAULT_DELETE_THRESHOLD_NS;
     float split_threshold_ns = DEFAULT_SPLIT_THRESHOLD_NS;
+    int max_splits_per_maintenance = -1; // -1 means no per-round split cap
 
     // SPFresh Param
     int max_partition_size = -1; // -1 means default to standard cost-based maintenance, if set then we use size-based thresholding

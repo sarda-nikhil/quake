@@ -183,6 +183,19 @@ TEST(MaintenancePolicyRefactoredTest, TriggerSplitting) {
   EXPECT_FALSE(found1);
 }
 
+TEST(MaintenancePolicyRefactoredTest, CapsSplitsPerMaintenanceRound) {
+  auto [parent, manager] = CreateParentAndManager(8, 4, 400);
+  auto params = make_shared<MaintenancePolicyParams>();
+  params->max_partition_size = 1;
+  params->max_splits_per_maintenance = 2;
+  params->refinement_radius = 0;
+
+  auto policy = make_shared<MaintenancePolicy>(manager, params);
+  shared_ptr<MaintenanceTimingInfo> info = policy->perform_maintenance();
+
+  EXPECT_EQ(info->n_splits, 2);
+}
+
 //
 // Optionally, if you have implemented local refinement in PartitionManager,
 // you can add a test that simulates a split and then verifies that refine_partitions()
