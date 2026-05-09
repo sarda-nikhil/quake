@@ -144,6 +144,7 @@ if(QUAKE_USE_HSSI)
         ${HSSI_ROOT}/src/pq.cc
         ${HSSI_ROOT}/src/quantizer.cc
         ${HSSI_ROOT}/src/turboquant.cc
+        ${HSSI_ROOT}/src/two_stage_tq.cc
     )
     set_target_properties(hssi_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_include_directories(hssi_core PUBLIC ${HSSI_ROOT}/include faiss)
