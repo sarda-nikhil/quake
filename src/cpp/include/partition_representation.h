@@ -248,6 +248,17 @@ public:
                                        int n,
                                        float* sum_out) const override;
 
+    void assign_to_centroids_and_accumulate(
+        const float* source_centroid,
+        const uint8_t* codes,
+        int n,
+        const float* candidate_centroids,
+        int num_candidates,
+        MetricType metric,
+        uint32_t* assignments_out,
+        float* sums_out,
+        int64_t* counts_out) const override;
+
     MaintenanceUncertaintyStats estimate_uncertainty(
         const float* centroid,
         const uint8_t* codes,

@@ -13,6 +13,24 @@
 #include <topk_buffer.h>
 #include "faiss/utils/distances.h"
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// CBLAS forward decl — same pattern as HSSI's anchor_codec.cc. Avoids
+// hard-coding /opt/homebrew/opt/openblas/include into the build flags;
+// we link against libopenblas via Quake's CMake linkopts and resolve
+// the symbol at link time. The CBLAS enum constants are stable across
+// the BLAS family.
+extern "C" {
+enum CBLAS_LAYOUT { CblasRowMajor = 101, CblasColMajor = 102 };
+enum CBLAS_TRANSPOSE { CblasNoTrans = 111, CblasTrans = 112 };
+void cblas_sgemm(enum CBLAS_LAYOUT layout, enum CBLAS_TRANSPOSE TransA,
+                 enum CBLAS_TRANSPOSE TransB, int M, int N, int K,
+                 float alpha, const float* A, int lda, const float* B,
+                 int ldb, float beta, float* C, int ldc);
+}  // extern "C"
+
 namespace {
 
 float centroid_score(const float* x,
@@ -109,21 +127,84 @@ void PartitionRepresentation::assign_to_centroids_and_accumulate(
     }
     const std::ptrdiff_t stride = code_size_bytes();
     const int d = dim();
-    std::vector<float> scratch(static_cast<size_t>(d));
-    for (int i = 0; i < n; ++i) {
-        reconstruct(source_centroid,
-                    codes + static_cast<std::ptrdiff_t>(i) * stride,
-                    scratch.data());
-        const int assigned = nearest_centroid(
-            scratch.data(), candidate_centroids, num_candidates, d, metric);
-        if (assignments_out != nullptr) {
-            assignments_out[i] = static_cast<uint32_t>(assigned);
+
+    // OpenMP-parallel scalar path. Per-vector work is reconstruct() +
+    // num_candidates × d-strided distance + per-coord accumulate. The
+    // compute is independent across `i`, but `sums_out` and `counts_out`
+    // are shared. We give each thread its own (sums, counts) buffer and
+    // do a serial reduction at the end. Buffer size is num_threads ×
+    // num_candidates × d floats — for typical (T=4, K=25, d=100) that's
+    // 40 KB, comfortably L1-resident.
+    //
+    // FP32 representations override this with a BLAS GEMM path; this
+    // base impl is what HSSI-backed reps inherit.
+
+#ifdef _OPENMP
+    int num_threads = omp_get_max_threads();
+    if (num_threads <= 0) num_threads = 1;
+#else
+    int num_threads = 1;
+#endif
+    // Cap by n — no point spinning up more threads than vectors. Cap by
+    // a reasonable upper bound to keep the per-thread reduction buffers
+    // bounded.
+    if (num_threads > n) num_threads = std::max(1, n);
+    if (num_threads > 16) num_threads = 16;
+
+    const std::size_t per_thread_sums_floats =
+        static_cast<std::size_t>(num_candidates) * d;
+    std::vector<float> tl_sums(static_cast<std::size_t>(num_threads) *
+                                 per_thread_sums_floats, 0.0f);
+    std::vector<int64_t> tl_counts(static_cast<std::size_t>(num_threads) *
+                                     num_candidates, 0);
+
+#pragma omp parallel num_threads(num_threads) if(num_threads > 1)
+    {
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        float* my_sums = tl_sums.data() +
+            static_cast<std::ptrdiff_t>(tid) * per_thread_sums_floats;
+        int64_t* my_counts = tl_counts.data() +
+            static_cast<std::ptrdiff_t>(tid) * num_candidates;
+        std::vector<float> scratch(static_cast<size_t>(d));
+
+#pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            reconstruct(source_centroid,
+                        codes + static_cast<std::ptrdiff_t>(i) * stride,
+                        scratch.data());
+            const int assigned = nearest_centroid(
+                scratch.data(), candidate_centroids, num_candidates, d,
+                metric);
+            if (assignments_out != nullptr) {
+                assignments_out[i] = static_cast<uint32_t>(assigned);
+            }
+            float* sum = my_sums +
+                static_cast<std::ptrdiff_t>(assigned) * d;
+            for (int j = 0; j < d; ++j) {
+                sum[j] += scratch[static_cast<size_t>(j)];
+            }
+            ++my_counts[assigned];
         }
-        float* sum = sums_out + static_cast<std::ptrdiff_t>(assigned) * d;
-        for (int j = 0; j < d; ++j) {
-            sum[j] += scratch[static_cast<size_t>(j)];
+    }
+
+    // Serial reduction. num_threads × num_candidates × d adds; for
+    // T=4, K=25, d=100 that's 10K FLOPs, dwarfed by the per-vector loop.
+    for (int t = 0; t < num_threads; ++t) {
+        const float* my_sums = tl_sums.data() +
+            static_cast<std::ptrdiff_t>(t) * per_thread_sums_floats;
+        const int64_t* my_counts = tl_counts.data() +
+            static_cast<std::ptrdiff_t>(t) * num_candidates;
+        for (int j = 0; j < num_candidates; ++j) {
+            const float* src = my_sums +
+                static_cast<std::ptrdiff_t>(j) * d;
+            float* dst = sums_out + static_cast<std::ptrdiff_t>(j) * d;
+            for (int k = 0; k < d; ++k) dst[k] += src[k];
+            counts_out[j] += my_counts[j];
         }
-        counts_out[assigned]++;
     }
 }
 
@@ -352,6 +433,138 @@ void Fp32PartitionRepresentation::accumulate_reconstruction_sum(
         const float* x = vectors + static_cast<std::ptrdiff_t>(i) * dim_;
         for (int j = 0; j < dim_; ++j) {
             sum_out[j] += x[j];
+        }
+    }
+}
+
+// FP32 BLAS-backed override for the maintenance refinement assignment.
+// The codec-aware refactor (kmeans_refine_partitions in clustering.cpp)
+// dispatches per chunk to representation->assign_to_centroids_and_accumulate;
+// the base implementation runs an OpenMP-parallel scalar loop. For FP32
+// where codes are uncompressed float vectors, BLAS GEMM beats parallel
+// scalar by another factor — a single sgemm computes -2·X·Cᵀ across all
+// (i, j) pairs, then a per-row argmin against ‖C‖² + (-2·X·Cᵀ)[i, j]
+// gives the assignment. This matches the path Quake's pre-codec-aware
+// kmeans_refine_partitions used (centroid_representation.scan_partition
+// → BLAS L2sqr) and removes the maintenance regression for FP32.
+void Fp32PartitionRepresentation::assign_to_centroids_and_accumulate(
+    const float* source_centroid,
+    const uint8_t* codes,
+    int n,
+    const float* candidate_centroids,
+    int num_candidates,
+    MetricType metric,
+    uint32_t* assignments_out,
+    float* sums_out,
+    int64_t* counts_out) const {
+    if (n <= 0 || num_candidates <= 0) {
+        return;
+    }
+    if (metric == faiss::METRIC_INNER_PRODUCT) {
+        // IP: argmax of <X, C>. The L2 GEMM trick gives the right
+        // ranking because x·c = (||x||² + ||c||² − ||x − c||²)/2 — but
+        // IP isn't in the maintenance hot path on this benchmark, so
+        // fall through to the scalar-OMP base path rather than ship a
+        // bespoke IP kernel.
+        PartitionRepresentation::assign_to_centroids_and_accumulate(
+            source_centroid, codes, n, candidate_centroids, num_candidates,
+            metric, assignments_out, sums_out, counts_out);
+        return;
+    }
+
+    const int d = dim_;
+    const float* x = reinterpret_cast<const float*>(codes);
+
+    // 1. -2 · X · Cᵀ → dots[n × num_candidates], single SGEMM call.
+    //    OpenBLAS internally picks the right number of threads; on
+    //    n2-standard-4 this lands on its GEMM kernels and saturates the
+    //    cores for the duration of the call.
+    std::vector<float> dots(static_cast<std::size_t>(n) *
+                              static_cast<std::size_t>(num_candidates));
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                /*M=*/n, /*N=*/num_candidates, /*K=*/d,
+                /*alpha=*/-2.0f, x, /*lda=*/d,
+                candidate_centroids, /*ldb=*/d,
+                /*beta=*/0.0f, dots.data(), /*ldc=*/num_candidates);
+
+    // 2. ||C[j]||² for each candidate.
+    std::vector<float> c_norms(static_cast<std::size_t>(num_candidates));
+    for (int j = 0; j < num_candidates; ++j) {
+        const float* c = candidate_centroids +
+            static_cast<std::ptrdiff_t>(j) * d;
+        float n2 = 0.0f;
+        for (int k = 0; k < d; ++k) n2 += c[k] * c[k];
+        c_norms[j] = n2;
+    }
+
+    // 3. Per-row argmin over (dots[i, j] + ||C[j]||²), then accumulate
+    //    sums + counts. This loop writes to sums/counts, so we use
+    //    per-thread buffers + serial reduction (same pattern as the
+    //    base impl). dim is small (~100), so the per-thread buffer is
+    //    L1-cheap.
+#ifdef _OPENMP
+    int num_threads = omp_get_max_threads();
+    if (num_threads <= 0) num_threads = 1;
+#else
+    int num_threads = 1;
+#endif
+    if (num_threads > n) num_threads = std::max(1, n);
+    if (num_threads > 16) num_threads = 16;
+
+    const std::size_t per_thread_sums_floats =
+        static_cast<std::size_t>(num_candidates) * d;
+    std::vector<float> tl_sums(static_cast<std::size_t>(num_threads) *
+                                 per_thread_sums_floats, 0.0f);
+    std::vector<int64_t> tl_counts(static_cast<std::size_t>(num_threads) *
+                                     num_candidates, 0);
+
+#pragma omp parallel num_threads(num_threads) if(num_threads > 1)
+    {
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        float* my_sums = tl_sums.data() +
+            static_cast<std::ptrdiff_t>(tid) * per_thread_sums_floats;
+        int64_t* my_counts = tl_counts.data() +
+            static_cast<std::ptrdiff_t>(tid) * num_candidates;
+
+#pragma omp for schedule(static)
+        for (int i = 0; i < n; ++i) {
+            const float* row = dots.data() +
+                static_cast<std::ptrdiff_t>(i) * num_candidates;
+            int best = 0;
+            float best_metric = row[0] + c_norms[0];
+            for (int j = 1; j < num_candidates; ++j) {
+                const float m = row[j] + c_norms[j];
+                if (m < best_metric) {
+                    best_metric = m;
+                    best = j;
+                }
+            }
+            if (assignments_out != nullptr) {
+                assignments_out[i] = static_cast<uint32_t>(best);
+            }
+            const float* xi = x + static_cast<std::ptrdiff_t>(i) * d;
+            float* sum = my_sums +
+                static_cast<std::ptrdiff_t>(best) * d;
+            for (int k = 0; k < d; ++k) sum[k] += xi[k];
+            ++my_counts[best];
+        }
+    }
+
+    for (int t = 0; t < num_threads; ++t) {
+        const float* my_sums = tl_sums.data() +
+            static_cast<std::ptrdiff_t>(t) * per_thread_sums_floats;
+        const int64_t* my_counts = tl_counts.data() +
+            static_cast<std::ptrdiff_t>(t) * num_candidates;
+        for (int j = 0; j < num_candidates; ++j) {
+            const float* src = my_sums +
+                static_cast<std::ptrdiff_t>(j) * d;
+            float* dst = sums_out + static_cast<std::ptrdiff_t>(j) * d;
+            for (int k = 0; k < d; ++k) dst[k] += src[k];
+            counts_out[j] += my_counts[j];
         }
     }
 }
