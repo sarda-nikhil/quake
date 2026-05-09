@@ -1,5 +1,6 @@
 #include "partition_representation.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <fstream>
@@ -11,6 +12,52 @@
 
 #include <topk_buffer.h>
 #include "faiss/utils/distances.h"
+
+namespace {
+
+float centroid_score(const float* x,
+                     const float* centroid,
+                     int d,
+                     MetricType metric) {
+    float score = 0.0f;
+    if (metric == faiss::METRIC_INNER_PRODUCT) {
+        for (int j = 0; j < d; ++j) {
+            score += x[j] * centroid[j];
+        }
+    } else {
+        for (int j = 0; j < d; ++j) {
+            const float diff = x[j] - centroid[j];
+            score += diff * diff;
+        }
+    }
+    return score;
+}
+
+int nearest_centroid(const float* x,
+                     const float* centroids,
+                     int num_centroids,
+                     int d,
+                     MetricType metric) {
+    if (num_centroids <= 0) {
+        throw std::invalid_argument("nearest_centroid: no candidates");
+    }
+    int best = 0;
+    float best_score = centroid_score(x, centroids, d, metric);
+    for (int c = 1; c < num_centroids; ++c) {
+        const float score = centroid_score(
+            x, centroids + static_cast<std::ptrdiff_t>(c) * d, d, metric);
+        const bool better = metric == faiss::METRIC_INNER_PRODUCT
+            ? score > best_score
+            : score < best_score;
+        if (better) {
+            best = c;
+            best_score = score;
+        }
+    }
+    return best;
+}
+
+}  // namespace
 
 void PartitionRepresentation::reconstruct_batch_for_maintenance(
     const float* centroid,
@@ -24,6 +71,94 @@ void PartitionRepresentation::reconstruct_batch_for_maintenance(
                     codes + i * stride,
                     vectors_out + i * dim_stride);
     }
+}
+
+void PartitionRepresentation::accumulate_reconstruction_sum(
+    const float* centroid,
+    const uint8_t* codes,
+    int n,
+    float* sum_out) const {
+    if (n <= 0) {
+        return;
+    }
+    const std::ptrdiff_t stride = code_size_bytes();
+    const int d = dim();
+    std::vector<float> scratch(static_cast<size_t>(d));
+    for (int i = 0; i < n; ++i) {
+        reconstruct(centroid,
+                    codes + static_cast<std::ptrdiff_t>(i) * stride,
+                    scratch.data());
+        for (int j = 0; j < d; ++j) {
+            sum_out[j] += scratch[static_cast<size_t>(j)];
+        }
+    }
+}
+
+void PartitionRepresentation::assign_to_centroids_and_accumulate(
+    const float* source_centroid,
+    const uint8_t* codes,
+    int n,
+    const float* candidate_centroids,
+    int num_candidates,
+    MetricType metric,
+    uint32_t* assignments_out,
+    float* sums_out,
+    int64_t* counts_out) const {
+    if (n <= 0) {
+        return;
+    }
+    const std::ptrdiff_t stride = code_size_bytes();
+    const int d = dim();
+    std::vector<float> scratch(static_cast<size_t>(d));
+    for (int i = 0; i < n; ++i) {
+        reconstruct(source_centroid,
+                    codes + static_cast<std::ptrdiff_t>(i) * stride,
+                    scratch.data());
+        const int assigned = nearest_centroid(
+            scratch.data(), candidate_centroids, num_candidates, d, metric);
+        if (assignments_out != nullptr) {
+            assignments_out[i] = static_cast<uint32_t>(assigned);
+        }
+        float* sum = sums_out + static_cast<std::ptrdiff_t>(assigned) * d;
+        for (int j = 0; j < d; ++j) {
+            sum[j] += scratch[static_cast<size_t>(j)];
+        }
+        counts_out[assigned]++;
+    }
+}
+
+MaintenanceUncertaintyStats PartitionRepresentation::estimate_uncertainty(
+    const float* centroid,
+    const uint8_t* codes,
+    int n) const {
+    MaintenanceUncertaintyStats stats;
+    if (n <= 0) {
+        return stats;
+    }
+    const std::ptrdiff_t stride = code_size_bytes();
+    const int d = dim();
+    std::vector<float> scratch(static_cast<size_t>(d));
+    for (int i = 0; i < n; ++i) {
+        reconstruct(centroid,
+                    codes + static_cast<std::ptrdiff_t>(i) * stride,
+                    scratch.data());
+        double radius_l2 = 0.0;
+        if (centroid != nullptr) {
+            for (int j = 0; j < d; ++j) {
+                const double diff =
+                    static_cast<double>(scratch[static_cast<size_t>(j)]) -
+                    static_cast<double>(centroid[j]);
+                radius_l2 += diff * diff;
+            }
+        }
+        ++stats.n;
+        stats.sum_radius_l2 += radius_l2;
+    }
+    return stats;
+}
+
+float PartitionRepresentation::maintenance_split_threshold_multiplier() const {
+    return 1.0f;
 }
 
 void PartitionRepresentation::encode_batch(const float* vectors,
@@ -108,6 +243,10 @@ int Fp32PartitionRepresentation::code_size_bytes() const {
 
 const char* Fp32PartitionRepresentation::kind() const {
     return "fp32";
+}
+
+float Fp32PartitionRepresentation::maintenance_split_threshold_multiplier() const {
+    return 1.0f;
 }
 
 void Fp32PartitionRepresentation::encode(const float* vector,
@@ -200,6 +339,48 @@ void Fp32PartitionRepresentation::reconstruct(const float* /*centroid*/,
     std::memcpy(vector_out, code, static_cast<size_t>(code_size_bytes_));
 }
 
+void Fp32PartitionRepresentation::accumulate_reconstruction_sum(
+    const float* /*centroid*/,
+    const uint8_t* codes,
+    int n,
+    float* sum_out) const {
+    if (n <= 0) {
+        return;
+    }
+    const float* vectors = reinterpret_cast<const float*>(codes);
+    for (int i = 0; i < n; ++i) {
+        const float* x = vectors + static_cast<std::ptrdiff_t>(i) * dim_;
+        for (int j = 0; j < dim_; ++j) {
+            sum_out[j] += x[j];
+        }
+    }
+}
+
+MaintenanceUncertaintyStats Fp32PartitionRepresentation::estimate_uncertainty(
+    const float* centroid,
+    const uint8_t* codes,
+    int n) const {
+    MaintenanceUncertaintyStats stats;
+    if (n <= 0) {
+        return stats;
+    }
+    const float* vectors = reinterpret_cast<const float*>(codes);
+    for (int i = 0; i < n; ++i) {
+        const float* x = vectors + static_cast<std::ptrdiff_t>(i) * dim_;
+        double radius_l2 = 0.0;
+        if (centroid != nullptr) {
+            for (int j = 0; j < dim_; ++j) {
+                const double diff =
+                    static_cast<double>(x[j]) - static_cast<double>(centroid[j]);
+                radius_l2 += diff * diff;
+            }
+        }
+        ++stats.n;
+        stats.sum_radius_l2 += radius_l2;
+    }
+    return stats;
+}
+
 void Fp32PartitionRepresentation::batch_reencode(const uint8_t* codes,
                                                  const uint32_t* /*assignments*/,
                                                  const float* /*centroids*/,
@@ -232,6 +413,13 @@ HssiPartitionRepresentation::HssiPartitionRepresentation(
     if (codec_ == nullptr) {
         throw std::invalid_argument("HssiPartitionRepresentation: codec must be non-null");
     }
+    const float fp32_bytes =
+        static_cast<float>(codec_->dim()) * static_cast<float>(sizeof(float));
+    const float code_bytes =
+        static_cast<float>(std::max(1, codec_->blob_size_bytes()));
+    const float compression_ratio = fp32_bytes / code_bytes;
+    maintenance_split_threshold_multiplier_ =
+        std::max(1.0f, compression_ratio * compression_ratio);
 }
 
 int HssiPartitionRepresentation::dim() const {
@@ -244,6 +432,10 @@ int HssiPartitionRepresentation::code_size_bytes() const {
 
 const char* HssiPartitionRepresentation::kind() const {
     return "hssi";
+}
+
+float HssiPartitionRepresentation::maintenance_split_threshold_multiplier() const {
+    return maintenance_split_threshold_multiplier_;
 }
 
 int HssiPartitionRepresentation::prepared_centroid_size_bytes() const {
@@ -518,6 +710,42 @@ void HssiPartitionRepresentation::reconstruct(const float* centroid,
             vector_out[d] += centroid[d];
         }
     }
+}
+
+void HssiPartitionRepresentation::accumulate_reconstruction_sum(
+    const float* centroid,
+    const uint8_t* codes,
+    int n,
+    float* sum_out) const {
+    if (n <= 0) {
+        return;
+    }
+    codec_->AccumulateDecodedSum(codes, n, sum_out);
+    if (reconstruction_mode_ ==
+        hssi::CodecReconstructionMode::kResidualPlusCentroid) {
+        if (centroid == nullptr) {
+            throw std::invalid_argument(
+                "HSSI residual reconstruction requires a centroid");
+        }
+        const float scale = static_cast<float>(n);
+        for (int d = 0; d < codec_->dim(); ++d) {
+            sum_out[d] += scale * centroid[d];
+        }
+    }
+}
+
+MaintenanceUncertaintyStats HssiPartitionRepresentation::estimate_uncertainty(
+    const float* centroid,
+    const uint8_t* codes,
+    int n) const {
+    MaintenanceUncertaintyStats stats =
+        PartitionRepresentation::estimate_uncertainty(centroid, codes, n);
+    hssi::QuantizationUncertaintyStats codec_stats;
+    codec_->AccumulateQuantizationUncertainty(codes, n, &codec_stats);
+    stats.sum_error_l2 = codec_stats.sum_error_l2;
+    stats.max_error_l2 = codec_stats.max_error_l2;
+    stats.n = std::max(stats.n, codec_stats.n);
+    return stats;
 }
 
 void HssiPartitionRepresentation::batch_reencode(const uint8_t* codes,

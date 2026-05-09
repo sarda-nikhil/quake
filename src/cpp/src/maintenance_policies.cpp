@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <numeric>
+#include <unordered_set>
 #include <utility>
 #include <torch/torch.h>
 
@@ -197,7 +199,44 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                 if (partition_size > params_->min_partition_size) {
                     float split_delta = cost_estimator_->compute_split_delta(
                         partition_size, hit_rate, total_partitions);
-                    bool should_split = split_delta < -params_->split_threshold_ns;
+                    float effective_split_threshold = params_->split_threshold_ns;
+                    float representation_multiplier =
+                        params_->representation_split_threshold_multiplier;
+                    if (representation_multiplier <= 0.0f &&
+                        partition_manager_->representation_ != nullptr) {
+                        representation_multiplier =
+                            partition_manager_->representation_
+                                ->maintenance_split_threshold_multiplier();
+                    }
+                    if (!std::isfinite(representation_multiplier) ||
+                        representation_multiplier < 1.0f) {
+                        representation_multiplier = 1.0f;
+                    }
+                    effective_split_threshold *= representation_multiplier;
+                    bool should_split = split_delta < -effective_split_threshold;
+                    if (should_split && params_->enable_quantization_uncertainty) {
+                        MaintenanceUncertaintyStats uncertainty =
+                            partition_manager_->estimate_uncertainty(
+                                partition_id, new_centroids_buffer);
+                        const double rel_error = uncertainty.relative_error();
+                        const bool has_quantization_noise =
+                            uncertainty.sum_error_l2 > 0.0;
+                        const bool uncertainty_too_high =
+                            has_quantization_noise &&
+                            params_->quantization_uncertainty_max_relative_error > 0.0f &&
+                            rel_error >
+                                params_->quantization_uncertainty_max_relative_error;
+                        const float uncertainty_margin_ns =
+                            static_cast<float>(
+                                static_cast<double>(effective_split_threshold) *
+                                static_cast<double>(
+                                    params_->quantization_uncertainty_split_multiplier) *
+                                rel_error);
+                        effective_split_threshold += uncertainty_margin_ns;
+                        should_split =
+                            !uncertainty_too_high &&
+                            split_delta < -effective_split_threshold;
+                    }
                     if constexpr(debug_) std::cout << "For partition " << partition_id << " of size " << partition_size << " got split delta " << split_delta << " leading to split decision of " << should_split << std::endl;
                     if (should_split) {
                         split_candidates.emplace_back(partition_id, split_delta);
@@ -316,19 +355,76 @@ void MaintenancePolicy::reset() {
 }
 
 void MaintenancePolicy::local_refinement(const torch::Tensor &partition_ids) {
-    Tensor split_centroids = partition_manager_->parent_->get(partition_ids);
-    auto search_params = std::make_shared<SearchParams>();
-    search_params->nprobe = 1000;
-    search_params->k = params_->refinement_radius;
-    search_params->batched_scan = true;
-    search_params->track_hits = false;
-
-    if (params_->refinement_radius == 0) {
+    if (params_->refinement_radius == 0 || partition_ids.numel() == 0) {
         return;
     }
 
-    auto result = partition_manager_->parent_->search(split_centroids, search_params);
-    Tensor refine_ids = std::get<0>(torch::_unique(result->ids));
-    refine_ids = refine_ids.masked_select(refine_ids != -1);
+    vector<int64_t> candidates;
+    candidates.reserve(static_cast<size_t>(partition_ids.numel()));
+    std::unordered_set<int64_t> seen;
+    auto append_candidate = [&](int64_t partition_id) {
+        if (partition_id < 0) {
+            return;
+        }
+        if (seen.insert(partition_id).second) {
+            candidates.push_back(partition_id);
+        }
+    };
+
+    Tensor split_children = partition_ids.cpu().contiguous();
+    auto split_children_accessor = split_children.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < split_children.size(0); ++i) {
+        append_candidate(split_children_accessor[i]);
+    }
+
+    if (!params_->refine_split_children_only) {
+        Tensor split_centroids = partition_manager_->parent_->get(partition_ids);
+        auto search_params = std::make_shared<SearchParams>();
+        search_params->nprobe = params_->refinement_nprobe;
+        search_params->k = params_->refinement_radius;
+        search_params->batched_scan = true;
+        search_params->track_hits = false;
+
+        auto result = partition_manager_->parent_->search(split_centroids, search_params);
+        Tensor neighbor_ids = result->ids.flatten().cpu().contiguous();
+        auto neighbor_accessor = neighbor_ids.accessor<int64_t, 1>();
+        for (int64_t i = 0; i < neighbor_ids.size(0); ++i) {
+            append_candidate(neighbor_accessor[i]);
+        }
+    }
+
+    vector<int64_t> selected;
+    selected.reserve(candidates.size());
+    int64_t selected_vectors = 0;
+    for (int64_t partition_id : candidates) {
+        if (params_->max_refine_partitions_per_maintenance >= 0 &&
+            selected.size() >= static_cast<size_t>(
+                params_->max_refine_partitions_per_maintenance)) {
+            break;
+        }
+        int64_t partition_size = partition_manager_->get_partition_size(partition_id);
+        if (params_->max_refine_vectors_per_maintenance >= 0 &&
+            !selected.empty() &&
+            selected_vectors + partition_size >
+                params_->max_refine_vectors_per_maintenance) {
+            break;
+        }
+        if (params_->max_refine_vectors_per_maintenance >= 0 &&
+            selected.empty() &&
+            partition_size > params_->max_refine_vectors_per_maintenance) {
+            break;
+        }
+        selected.push_back(partition_id);
+        selected_vectors += partition_size;
+    }
+
+    if (selected.empty()) {
+        return;
+    }
+
+    Tensor refine_ids = torch::from_blob(
+        selected.data(),
+        {static_cast<int64_t>(selected.size())},
+        torch::kInt64).clone();
     partition_manager_->refine_partitions(refine_ids, params_->refinement_iterations);
 }

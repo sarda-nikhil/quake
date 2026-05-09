@@ -16,41 +16,6 @@
 
 using std::runtime_error;
 
-namespace {
-
-float vector_score(const float* x,
-                   const float* centroid,
-                   int d,
-                   MetricType metric) {
-    float score = 0.0f;
-    if (metric == faiss::METRIC_INNER_PRODUCT) {
-        for (int j = 0; j < d; ++j) {
-            score += x[j] * centroid[j];
-        }
-    } else {
-        for (int j = 0; j < d; ++j) {
-            float diff = x[j] - centroid[j];
-            score += diff * diff;
-        }
-    }
-    return score;
-}
-
-int nearest_split_centroid(const float* x,
-                           const float* c0,
-                           const float* c1,
-                           int d,
-                           MetricType metric) {
-    float s0 = vector_score(x, c0, d, metric);
-    float s1 = vector_score(x, c1, d, metric);
-    if (metric == faiss::METRIC_INNER_PRODUCT) {
-        return s1 > s0 ? 1 : 0;
-    }
-    return s1 < s0 ? 1 : 0;
-}
-
-}  // namespace
-
 PartitionManager::PartitionManager() {
     parent_ = nullptr;
     partition_store_ = nullptr;
@@ -655,12 +620,15 @@ shared_ptr<Clustering> PartitionManager::split_partitions(const Tensor &partitio
 
         int64_t chunk_capacity =
             std::max<int64_t>(1, std::min<int64_t>(kSplitChunkVectors, list_size));
-        vector<float> decoded_chunk(
-            static_cast<size_t>(chunk_capacity) * static_cast<size_t>(d));
+        vector<float> split_centroid_candidates(
+            static_cast<size_t>(num_splits) * static_cast<size_t>(d));
         vector<float> sums(static_cast<size_t>(num_splits) * static_cast<size_t>(d));
         vector<int64_t> counts(num_splits);
 
         for (int iter = 0; iter < iterations; ++iter) {
+            std::copy(c0.begin(), c0.end(), split_centroid_candidates.begin());
+            std::copy(c1.begin(), c1.end(),
+                      split_centroid_candidates.begin() + d);
             std::fill(sums.begin(), sums.end(), 0.0f);
             std::fill(counts.begin(), counts.end(), 0);
 
@@ -669,22 +637,16 @@ shared_ptr<Clustering> PartitionManager::split_partitions(const Tensor &partitio
                     std::min<int64_t>(chunk_capacity, list_size - offset));
                 const uint8_t* chunk_codes =
                     source_partition->codes_ + offset * code_size;
-                representation_->reconstruct_batch_for_maintenance(
+                representation_->assign_to_centroids_and_accumulate(
                     source_centroid.data(),
                     chunk_codes,
                     chunk_n,
-                    decoded_chunk.data());
-
-                for (int row = 0; row < chunk_n; ++row) {
-                    const float* x = decoded_chunk.data() + row * d;
-                    int assignment = nearest_split_centroid(
-                        x, c0.data(), c1.data(), d, parent_->metric_);
-                    counts[assignment]++;
-                    float* sum = sums.data() + assignment * d;
-                    for (int j = 0; j < d; ++j) {
-                        sum[j] += x[j];
-                    }
-                }
+                    split_centroid_candidates.data(),
+                    static_cast<int>(num_splits),
+                    parent_->metric_,
+                    nullptr,
+                    sums.data(),
+                    counts.data());
             }
 
             for (int split = 0; split < num_splits; ++split) {
@@ -712,29 +674,50 @@ shared_ptr<Clustering> PartitionManager::split_partitions(const Tensor &partitio
         split0->resize(std::max<int64_t>(10, list_size / 2));
         split1->resize(std::max<int64_t>(10, list_size / 2));
 
-        vector<uint8_t> encoded(static_cast<size_t>(code_size));
+        std::copy(c0_out, c0_out + d, split_centroid_candidates.begin());
+        std::copy(c1_out, c1_out + d,
+                  split_centroid_candidates.begin() + d);
+        vector<uint32_t> assignments(static_cast<size_t>(chunk_capacity));
+        vector<int64_t> assignment_counts(num_splits);
+        vector<float> assignment_sums(
+            static_cast<size_t>(num_splits) * static_cast<size_t>(d));
+        vector<uint8_t> reencoded_codes(
+            static_cast<size_t>(chunk_capacity) * static_cast<size_t>(code_size));
         for (int64_t offset = 0; offset < list_size; offset += chunk_capacity) {
             int chunk_n = static_cast<int>(
                 std::min<int64_t>(chunk_capacity, list_size - offset));
             const uint8_t* chunk_codes =
                 source_partition->codes_ + offset * code_size;
-            representation_->reconstruct_batch_for_maintenance(
+            std::fill(assignment_sums.begin(), assignment_sums.end(), 0.0f);
+            std::fill(assignment_counts.begin(), assignment_counts.end(), 0);
+            representation_->assign_to_centroids_and_accumulate(
                 source_centroid.data(),
                 chunk_codes,
                 chunk_n,
-                decoded_chunk.data());
+                split_centroid_candidates.data(),
+                static_cast<int>(num_splits),
+                parent_->metric_,
+                assignments.data(),
+                assignment_sums.data(),
+                assignment_counts.data());
 
+            representation_->batch_reencode(
+                chunk_codes,
+                assignments.data(),
+                split_centroid_candidates.data(),
+                static_cast<int>(num_splits),
+                chunk_n,
+                reencoded_codes.data());
             for (int row = 0; row < chunk_n; ++row) {
-                const float* x = decoded_chunk.data() + row * d;
-                int assignment = nearest_split_centroid(
-                    x, c0.data(), c1.data(), d, parent_->metric_);
-                const float* dst_centroid = assignment == 0 ? c0_out : c1_out;
+                int assignment = static_cast<int>(
+                    assignments[static_cast<size_t>(row)]);
                 auto& dst_partition = assignment == 0 ? split0 : split1;
-                representation_->encode(x, dst_centroid, encoded.data());
                 dst_partition->append(
                     1,
                     source_partition->ids_ + offset + row,
-                    encoded.data());
+                    reencoded_codes.data() +
+                        static_cast<size_t>(row) *
+                            static_cast<size_t>(code_size));
             }
         }
 
@@ -807,8 +790,6 @@ int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_
     constexpr int64_t kCentroidUpdateChunkVectors = 4096;
     const int64_t chunk_capacity = std::max<int64_t>(
         1, std::min<int64_t>(kCentroidUpdateChunkVectors, curr_size));
-    vector<float> decoded_chunk(
-        static_cast<size_t>(chunk_capacity) * static_cast<size_t>(dimension));
     const int code_size = representation_->code_size_bytes();
 
     for (int64_t offset = 0; offset < curr_size; offset += chunk_capacity) {
@@ -818,19 +799,11 @@ int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_
             curr_partition->codes_ +
             static_cast<std::ptrdiff_t>(offset) * code_size;
 
-        representation_->reconstruct_batch_for_maintenance(
+        representation_->accumulate_reconstruction_sum(
             decode_centroid.data(),
             chunk_codes,
             chunk_n,
-            decoded_chunk.data());
-
-        for (int i = 0; i < chunk_n; ++i) {
-            const float* vector_ptr =
-                decoded_chunk.data() + static_cast<std::ptrdiff_t>(i) * dimension;
-            for (int j = 0; j < dimension; ++j) {
-                centroid_buffer[j] += vector_ptr[j];
-            }
-        }
+            centroid_buffer);
     }
 
     const float inv_size = 1.0f / static_cast<float>(curr_size);
@@ -866,6 +839,22 @@ int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_
 
     curr_partition->reset_delta();
     return delta_size;
+}
+
+MaintenanceUncertaintyStats PartitionManager::estimate_uncertainty(
+    int64_t partition_id,
+    const float* centroid) {
+    if (representation_ == nullptr || partition_store_ == nullptr) {
+        return MaintenanceUncertaintyStats();
+    }
+    auto partition = partition_store_->get_partition(partition_id);
+    if (partition == nullptr || partition->num_vectors_ <= 0) {
+        return MaintenanceUncertaintyStats();
+    }
+    return representation_->estimate_uncertainty(
+        centroid,
+        partition->codes_,
+        static_cast<int>(partition->num_vectors_));
 }
 
 void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {

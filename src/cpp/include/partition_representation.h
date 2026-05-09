@@ -36,6 +36,15 @@ public:
     virtual const char* kind() const = 0;
 
     /**
+     * @brief Representation-specific split confidence multiplier.
+     *
+     * Quake's maintenance cost model is calibrated on FP32 list scans. Encoded
+     * representations can have different scan benefit and rewrite cost, so
+     * their split predicate should require proportionally stronger evidence.
+     */
+    virtual float maintenance_split_threshold_multiplier() const;
+
+    /**
      * @brief Encode one vector for storage in a partition with centroid.
      */
     virtual void encode(const float* vector,
@@ -122,6 +131,49 @@ public:
                                                    float* vectors_out) const;
 
     /**
+     * @brief Add the sum of decoded vectors to |sum_out|.
+     *
+     * This is the maintenance sufficient-stat hook. Implementations should
+     * avoid materializing n x dim FP32 buffers; the default streams one
+     * decoded vector through a dim-sized scratch buffer.
+     */
+    virtual void accumulate_reconstruction_sum(const float* centroid,
+                                               const uint8_t* codes,
+                                               int n,
+                                               float* sum_out) const;
+
+    /**
+     * @brief Assign decoded vectors to candidate centroids and accumulate
+     * sufficient statistics.
+     *
+     * |candidate_centroids| is num_candidates x dim. |assignments_out| may be
+     * null. |sums_out| and |counts_out| are additive accumulators and must be
+     * zeroed by the caller when a fresh pass is desired.
+     */
+    virtual void assign_to_centroids_and_accumulate(
+        const float* source_centroid,
+        const uint8_t* codes,
+        int n,
+        const float* candidate_centroids,
+        int num_candidates,
+        MetricType metric,
+        uint32_t* assignments_out,
+        float* sums_out,
+        int64_t* counts_out) const;
+
+    /**
+     * @brief Estimate quantization uncertainty and apparent partition spread.
+     *
+     * FP32 returns zero error. HSSI-backed representations can report a codec
+     * noise floor from their code bytes. |centroid| is used only to compute
+     * the apparent decoded radius of the partition.
+     */
+    virtual MaintenanceUncertaintyStats estimate_uncertainty(
+        const float* centroid,
+        const uint8_t* codes,
+        int n) const;
+
+    /**
      * @brief Re-encode a batch of payloads under new partition centroids.
      *
      * `assignments[i]` is the destination partition id for code `i`. The
@@ -150,6 +202,7 @@ public:
     int dim() const override;
     int code_size_bytes() const override;
     const char* kind() const override;
+    float maintenance_split_threshold_multiplier() const override;
 
     void encode(const float* vector,
                 const float* centroid,
@@ -190,6 +243,16 @@ public:
                      const uint8_t* code,
                      float* vector_out) const override;
 
+    void accumulate_reconstruction_sum(const float* centroid,
+                                       const uint8_t* codes,
+                                       int n,
+                                       float* sum_out) const override;
+
+    MaintenanceUncertaintyStats estimate_uncertainty(
+        const float* centroid,
+        const uint8_t* codes,
+        int n) const override;
+
     void batch_reencode(const uint8_t* codes,
                         const uint32_t* assignments,
                         const float* centroids,
@@ -221,6 +284,7 @@ public:
     int dim() const override;
     int code_size_bytes() const override;
     const char* kind() const override;
+    float maintenance_split_threshold_multiplier() const override;
 
     void encode(const float* vector,
                 const float* centroid,
@@ -266,6 +330,16 @@ public:
                      const uint8_t* code,
                      float* vector_out) const override;
 
+    void accumulate_reconstruction_sum(const float* centroid,
+                                       const uint8_t* codes,
+                                       int n,
+                                       float* sum_out) const override;
+
+    MaintenanceUncertaintyStats estimate_uncertainty(
+        const float* centroid,
+        const uint8_t* codes,
+        int n) const override;
+
     void batch_reencode(const uint8_t* codes,
                         const uint32_t* assignments,
                         const float* centroids,
@@ -288,6 +362,7 @@ private:
     mutable std::mutex scan_major_cache_mutex_;
     mutable std::unordered_map<uint64_t, std::shared_ptr<ScanMajorCacheEntry>>
         scan_major_cache_;
+    float maintenance_split_threshold_multiplier_ = 1.0f;
 
     std::shared_ptr<ScanMajorCacheEntry> get_scan_major_cache(
         uint64_t storage_key,

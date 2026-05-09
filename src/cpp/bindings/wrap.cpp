@@ -280,6 +280,34 @@ PYBIND11_MODULE(_bindings, m) {
              (std::string("Split threshold (ns). default = ") + std::to_string(DEFAULT_SPLIT_THRESHOLD_NS)).c_str())
         .def_readwrite("max_splits_per_maintenance", &MaintenancePolicyParams::max_splits_per_maintenance,
              "Maximum split decisions to execute in one maintenance round. -1 disables the cap.")
+        .def_readwrite("representation_split_threshold_multiplier",
+             &MaintenancePolicyParams::representation_split_threshold_multiplier,
+             "Codec-aware split-threshold multiplier. <=0 uses the active "
+             "representation's default (FP32: 1.0; HSSI: representation-specific).")
+        .def_readwrite("refinement_nprobe", &MaintenancePolicyParams::refinement_nprobe,
+             "nprobe used by local refinement neighbor search. default = 1000.")
+        .def_readwrite("max_refine_partitions_per_maintenance",
+             &MaintenancePolicyParams::max_refine_partitions_per_maintenance,
+             "Maximum partitions touched by local refinement per round. -1 = no cap.")
+        .def_readwrite("max_refine_vectors_per_maintenance",
+             &MaintenancePolicyParams::max_refine_vectors_per_maintenance,
+             "Maximum vectors touched by local refinement per round. -1 = no cap.")
+        .def_readwrite("refine_split_children_only",
+             &MaintenancePolicyParams::refine_split_children_only,
+             "When true, local refinement processes only split children; skips "
+             "neighbor expansion. default = false.")
+        .def_readwrite("enable_quantization_uncertainty",
+             &MaintenancePolicyParams::enable_quantization_uncertainty,
+             "When true, the split predicate inflates its confidence margin by "
+             "the partition's codec quantization-uncertainty signal. default = false.")
+        .def_readwrite("quantization_uncertainty_split_multiplier",
+             &MaintenancePolicyParams::quantization_uncertainty_split_multiplier,
+             "Multiplier for the uncertainty-driven split-margin inflation. "
+             "default = 1.0.")
+        .def_readwrite("quantization_uncertainty_max_relative_error",
+             &MaintenancePolicyParams::quantization_uncertainty_max_relative_error,
+             "Hard guard: suppress splits whose relative codec error exceeds "
+             "this bound. <=0 disables the guard. default = -1.")
         .def("__repr__", [](const MaintenancePolicyParams &m) {
             std::ostringstream oss;
             oss << "{";

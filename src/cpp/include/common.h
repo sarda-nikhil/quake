@@ -119,6 +119,36 @@ constexpr int DEFAULT_LATENCY_ESTIMATOR_NTRIALS = 5;                            
 // macros
 #define DEBUG_PRINT(x) std::cout << #x << " = " << x << std::endl;
 
+/**
+ * @brief Per-partition maintenance signals consumed by the cost model.
+ *
+ * Codec-aware extension of the FP32-only split predicate: codec error
+ * variance (`sum_error_l2`) and apparent partition spread (`sum_radius_l2`)
+ * combine into a dimensionless `relative_error()` ratio. When that ratio
+ * approaches 1, splitting won't separate clusters because the codec noise
+ * floor dominates the partition's geometry — so the maintenance policy
+ * either inflates the split-confidence margin proportionally or drops the
+ * split entirely.
+ */
+struct MaintenanceUncertaintyStats {
+    int64_t n = 0;
+    double sum_error_l2 = 0.0;
+    double max_error_l2 = 0.0;
+    double sum_radius_l2 = 0.0;
+
+    double mean_error_l2() const {
+        return n > 0 ? sum_error_l2 / static_cast<double>(n) : 0.0;
+    }
+    double mean_radius_l2() const {
+        return n > 0 ? sum_radius_l2 / static_cast<double>(n) : 0.0;
+    }
+    /// Codec quantization noise as a fraction of partition spread. Zero
+    /// when the partition is empty or has no apparent radius.
+    double relative_error() const {
+        return sum_radius_l2 > 0.0 ? sum_error_l2 / sum_radius_l2 : 0.0;
+    }
+};
+
 struct MaintenancePolicyParams {
     std::string maintenance_policy = DEFAULT_MAINTENANCE_POLICY;
     int window_size = DEFAULT_WINDOW_SIZE;
@@ -133,6 +163,30 @@ struct MaintenancePolicyParams {
     float delete_threshold_ns = DEFAULT_DELETE_THRESHOLD_NS;
     float split_threshold_ns = DEFAULT_SPLIT_THRESHOLD_NS;
     int max_splits_per_maintenance = -1; // -1 means no per-round split cap
+
+    // Codec-aware split throttling: <=0 uses the active representation's own
+    // multiplier (FP32 reports 1.0; HSSI reports its representation-specific
+    // default). >0 overrides everywhere.
+    float representation_split_threshold_multiplier = -1.0f;
+
+    // Local-refinement bounding. Pre-tuning Quake hard-coded nprobe=1000 and
+    // ran refinement over an unbounded ball of neighbors around each split
+    // child; encoded representations need both knobs tunable to keep
+    // maintenance time linear in actual split work.
+    int refinement_nprobe = 1000;
+    int max_refine_partitions_per_maintenance = -1; // -1 = no cap
+    int max_refine_vectors_per_maintenance = -1;    // -1 = no cap
+    bool refine_split_children_only = false;
+
+    // Quantization-uncertainty-aware split confidence margin. Off by default
+    // — the cost model assumes FP32 and only HSSI representations populate
+    // a meaningful uncertainty signal.
+    bool enable_quantization_uncertainty = false;
+    float quantization_uncertainty_split_multiplier = 1.0f;
+    // When >0, suppress splits whose relative codec error exceeds this
+    // bound regardless of the cost-delta margin. <=0 disables the hard
+    // guard and falls back to margin-only inflation.
+    float quantization_uncertainty_max_relative_error = -1.0f;
 
     // SPFresh Param
     int max_partition_size = -1; // -1 means default to standard cost-based maintenance, if set then we use size-based thresholding

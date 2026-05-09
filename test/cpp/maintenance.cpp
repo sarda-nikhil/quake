@@ -183,6 +183,36 @@ TEST(MaintenancePolicyRefactoredTest, TriggerSplitting) {
   EXPECT_FALSE(found1);
 }
 
+TEST(MaintenancePolicyRefactoredTest, RepresentationMultiplierSuppressesMarginalSplits) {
+  auto [parent, manager] = CreateParentAndManager(3, 4, 100);
+  auto params = make_shared<MaintenancePolicyParams>();
+  params->window_size = 3;
+  params->alpha = 0.5f;
+  params->split_threshold_ns = 1.0f;
+  params->representation_split_threshold_multiplier = 1.0e12f;
+  params->delete_threshold_ns = 1000.0f;
+  params->min_partition_size = 1;
+
+  auto policy = make_shared<MaintenancePolicy>(manager, params);
+  for (int i = 0; i < 5; i++) {
+    policy->record_query_hits({1});
+  }
+
+  shared_ptr<MaintenanceTimingInfo> info = policy->perform_maintenance();
+
+  EXPECT_EQ(info->n_splits, 0);
+  Tensor pids = manager->get_partition_ids();
+  auto pids_accessor = pids.accessor<int64_t, 1>();
+  bool found1 = false;
+  for (int i = 0; i < pids.size(0); i++) {
+    if (pids_accessor[i] == 1) {
+      found1 = true;
+      break;
+    }
+  }
+  EXPECT_TRUE(found1);
+}
+
 TEST(MaintenancePolicyRefactoredTest, CapsSplitsPerMaintenanceRound) {
   auto [parent, manager] = CreateParentAndManager(8, 4, 400);
   auto params = make_shared<MaintenancePolicyParams>();
@@ -194,6 +224,23 @@ TEST(MaintenancePolicyRefactoredTest, CapsSplitsPerMaintenanceRound) {
   shared_ptr<MaintenanceTimingInfo> info = policy->perform_maintenance();
 
   EXPECT_EQ(info->n_splits, 2);
+}
+
+TEST(MaintenancePolicyRefactoredTest, BoundsLocalRefinementWork) {
+  auto [parent, manager] = CreateParentAndManager(8, 4, 400);
+  auto params = make_shared<MaintenancePolicyParams>();
+  params->max_partition_size = 1;
+  params->max_splits_per_maintenance = 3;
+  params->refinement_radius = 4;
+  params->refine_split_children_only = true;
+  params->max_refine_partitions_per_maintenance = 2;
+  params->max_refine_vectors_per_maintenance = 100;
+
+  auto policy = make_shared<MaintenancePolicy>(manager, params);
+  shared_ptr<MaintenanceTimingInfo> info = policy->perform_maintenance();
+
+  EXPECT_EQ(info->n_splits, 3);
+  EXPECT_GE(info->refinement_time_us, 0);
 }
 
 //

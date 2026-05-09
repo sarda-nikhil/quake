@@ -145,6 +145,12 @@ public:
     int64_t update_centroid(int64_t partition_id, float* centroid_buffer);
 
     /**
+     * @brief Estimate maintenance uncertainty for a partition.
+     */
+    MaintenanceUncertaintyStats estimate_uncertainty(int64_t partition_id,
+                                                     const float* centroid);
+
+    /**
      * @brief Select partitions and their centroids.
      * @param partition_ids Tensor of shape [num_partitions] containing partition IDs.
      * @param copy If true, copies the data; otherwise, uses references.
