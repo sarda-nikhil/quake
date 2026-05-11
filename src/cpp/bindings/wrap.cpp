@@ -210,6 +210,13 @@ PYBIND11_MODULE(_bindings, m) {
              (std::string("Threshold to trigger recomputation of APS. default = ") + std::to_string(DEFAULT_RECOMPUTE_THRESHOLD)).c_str())
         .def_readwrite("aps_flush_period_us", &SearchParams::aps_flush_period_us,
              (std::string("APS flush period in microseconds. default = ") + std::to_string(DEFAULT_APS_FLUSH_PERIOD_US)).c_str())
+        .def_readwrite("aps_codec_inflation_alpha",
+             &SearchParams::aps_codec_inflation_alpha,
+             (std::string("Multiplier on the codec's analytic distance stddev "
+                          "(σ_d) for codec-aware APS radius inflation. 0 "
+                          "disables (FP32-equivalent). default = ") +
+              std::to_string(DEFAULT_APS_CODEC_INFLATION_ALPHA))
+                 .c_str())
         .def_readwrite("batch_size", &SearchParams::batch_size,
              (std::string("Batch size for batched scan. default = ") + std::to_string(MAX_SUBBATCH)).c_str())
         .def_readwrite("k_factor", &SearchParams::k_factor,
@@ -308,6 +315,15 @@ PYBIND11_MODULE(_bindings, m) {
              &MaintenancePolicyParams::quantization_uncertainty_max_relative_error,
              "Hard guard: suppress splits whose relative codec error exceeds "
              "this bound. <=0 disables the guard. default = -1.")
+        .def_readwrite("partition_drift_split_threshold",
+             &MaintenancePolicyParams::partition_drift_split_threshold,
+             "Recall-driven split trigger. When >0, a partition whose "
+             "centroid has drifted from the actual decoded mean of its "
+             "members by more than this fraction of its squared radius "
+             "is force-split, bypassing the cost-model multiplier and "
+             "uncertainty gate. Required for codecs under inserts to "
+             "stay adaptive. Reasonable values 0.1–0.3. default = 0 "
+             "(disabled, legacy cost-model-only behavior).")
         .def("__repr__", [](const MaintenancePolicyParams &m) {
             std::ostringstream oss;
             oss << "{";

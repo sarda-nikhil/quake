@@ -763,15 +763,34 @@ float PartitionManager::get_delete_factor(int64_t partition_id) {
     return (1.0 * num_deletes)/previous_size;
 }
 
-int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_buffer) { 
+int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_buffer,
+                                          double* drift_l2_out) {
     const int dimension = dim_;
     std::shared_ptr<IndexPartition> curr_partition =
         partition_store_->get_partition(partition_id);
     int64_t delta_size = curr_partition->delta_count_;
+    if (drift_l2_out != nullptr) *drift_l2_out = 0.0;
     if (delta_size == 0 || curr_partition->num_vectors_ == 0) {
+        // Even when there's nothing to recompute, the buffer must reflect
+        // the *current* centroid: callers (notably the drift-driven split
+        // trigger in maintenance_policies.cpp) feed it straight into
+        // estimate_uncertainty and would otherwise see a stale buffer
+        // left over from a previous partition's update_centroid call.
+        if (centroid_buffer != nullptr) {
+            std::vector<float> current(dimension, 0.0f);
+            if (get_partition_centroid(partition_id, current.data())) {
+                std::copy(current.begin(), current.end(), centroid_buffer);
+            } else {
+                std::fill(centroid_buffer, centroid_buffer + dimension, 0.0f);
+            }
+        }
         curr_partition->reset_delta();
         return delta_size;
     }
+    // Capture the pre-update centroid so we can report how far it moved.
+    std::vector<float> old_centroid(dimension, 0.0f);
+    const bool have_old = (drift_l2_out != nullptr) &&
+        get_partition_centroid(partition_id, old_centroid.data());
 
     int64_t old_size = curr_partition->last_snapshot_size_;
     int64_t curr_size = curr_partition->num_vectors_;
@@ -836,6 +855,16 @@ int64_t PartitionManager::update_centroid(int64_t partition_id, float* centroid_
     // Centroid moved — refresh the prepared bytes so the next search call
     // streams the post-update rotation.
     ensure_prepared_centroid(partition_id);
+
+    if (drift_l2_out != nullptr && have_old) {
+        double drift_l2 = 0.0;
+        for (int j = 0; j < dimension; ++j) {
+            const double diff = static_cast<double>(old_centroid[j]) -
+                                static_cast<double>(centroid_buffer[j]);
+            drift_l2 += diff * diff;
+        }
+        *drift_l2_out = drift_l2;
+    }
 
     curr_partition->reset_delta();
     return delta_size;

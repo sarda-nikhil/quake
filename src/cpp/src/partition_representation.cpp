@@ -238,6 +238,10 @@ MaintenanceUncertaintyStats PartitionRepresentation::estimate_uncertainty(
     return stats;
 }
 
+float PartitionRepresentation::decoded_distance_stddev() const {
+    return 0.0f;
+}
+
 float PartitionRepresentation::maintenance_split_threshold_multiplier() const {
     return 1.0f;
 }
@@ -649,6 +653,10 @@ const char* HssiPartitionRepresentation::kind() const {
 
 float HssiPartitionRepresentation::maintenance_split_threshold_multiplier() const {
     return maintenance_split_threshold_multiplier_;
+}
+
+float HssiPartitionRepresentation::decoded_distance_stddev() const {
+    return codec_->DecodedDistanceStdDev();
 }
 
 int HssiPartitionRepresentation::prepared_centroid_size_bytes() const {

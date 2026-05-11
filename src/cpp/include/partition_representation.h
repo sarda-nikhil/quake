@@ -174,6 +174,18 @@ public:
         int n) const;
 
     /**
+     * @brief Population stddev of decoded asymmetric L2 distance vs the true
+     * distance, derived analytically from the codec's quantization parameters.
+     * Used by APS to inflate the heap pivot before computing recall_profile,
+     * compensating for the downward bias of the K-th order statistic of noisy
+     * decoded distances.
+     *
+     * Default returns 0 (FP32 / codecs without a calibrated estimate). When 0,
+     * APS uses the heap pivot unchanged and reproduces the legacy FP32 path.
+     */
+    virtual float decoded_distance_stddev() const;
+
+    /**
      * @brief Re-encode a batch of payloads under new partition centroids.
      *
      * `assignments[i]` is the destination partition id for code `i`. The
@@ -350,6 +362,8 @@ public:
         const float* centroid,
         const uint8_t* codes,
         int n) const override;
+
+    float decoded_distance_stddev() const override;
 
     void batch_reencode(const uint8_t* codes,
                         const uint32_t* assignments,

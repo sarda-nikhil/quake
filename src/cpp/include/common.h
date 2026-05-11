@@ -93,6 +93,7 @@ constexpr float DEFAULT_INITIAL_SEARCH_FRACTION = 0.1f; ///< Default initial fra
 constexpr float DEFAULT_ADAPTIVE_NPROBE_MULTIPLIER = 1.0f; ///< Multiplier applied to the APS-recommended scan count.
 constexpr float DEFAULT_RECOMPUTE_THRESHOLD = 0.001f;    ///< Default threshold to trigger recomputation of search parameters.
 constexpr int DEFAULT_APS_FLUSH_PERIOD_US = 5;         ///< Default period (in microseconds) for flushing the APS buffer.
+constexpr float DEFAULT_APS_CODEC_INFLATION_ALPHA = 0.0f; ///< Multiplier on codec σ_d for APS radius inflation. 0 disables (FP32-equivalent).
 constexpr int MAX_SUBBATCH = 128;
 constexpr int MIN_BATCH_SCAN_SIZE = 4; ///< Minimum batch size for scanning partitions.
 constexpr int BLAS_DB_BS = 256;
@@ -188,6 +189,18 @@ struct MaintenancePolicyParams {
     // guard and falls back to margin-only inflation.
     float quantization_uncertainty_max_relative_error = -1.0f;
 
+    // Recall-driven split trigger. The latency-only cost model can't see
+    // when a partition has drifted off-center under inserts; under codec
+    // compression its threshold also gets multiplied by compression² so
+    // splits never fire and the index goes stale. This trigger forces a
+    // split when ||c − decode_mean(blobs)||² / mean_radius_l2 exceeds the
+    // threshold, bypassing the cost-model multiplier and uncertainty
+    // gate. Codec-noise-tolerant: codec error contributes proportionally
+    // to numerator and denominator, so the ratio is dominated by genuine
+    // geometric drift. Default 0.0 disables the trigger and preserves
+    // legacy cost-model-only behavior. Reasonable values are 0.1–0.3.
+    float partition_drift_split_threshold = 0.0f;
+
     // SPFresh Param
     int max_partition_size = -1; // -1 means default to standard cost-based maintenance, if set then we use size-based thresholding
 
@@ -270,6 +283,15 @@ struct SearchParams {
     float initial_search_fraction = DEFAULT_INITIAL_SEARCH_FRACTION;
     float adaptive_nprobe_multiplier = DEFAULT_ADAPTIVE_NPROBE_MULTIPLIER;
     int aps_flush_period_us = DEFAULT_APS_FLUSH_PERIOD_US;
+    // Codec-aware APS radius inflation (Path B in the design): the K-th
+    // order statistic of noisy decoded distances biases the heap pivot
+    // downward by roughly σ_d (a constant of the codec). Multiplying that
+    // σ_d by this α and adding to the pivot before computing the recall
+    // profile compensates for the bias. The representation reports σ_d
+    // analytically; α is the only knob a caller tunes. 0 disables the
+    // inflation entirely (FP32-equivalent), and FP32 representations
+    // report σ_d=0 anyway so the field is a no-op there.
+    float aps_codec_inflation_alpha = DEFAULT_APS_CODEC_INFLATION_ALPHA;
     int sample_prefix = 0;
     int sample_stride = 10;
 

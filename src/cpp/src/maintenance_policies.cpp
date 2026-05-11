@@ -97,7 +97,14 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
             // Update the centroid for this vector if we have a delta
             bool choose_partition = false;
             float delete_factor = partition_manager_->get_delete_factor(partition_id);
-            partition_manager_->update_centroid(partition_id, new_centroids_buffer);
+            // |centroid_drift_l2| captures how far the centroid moved during
+            // this update — the recall-driven split trigger reads it because
+            // by the time estimate_uncertainty runs the centroid has been
+            // reset to the decoded mean and ||c − decode_mean|| has collapsed
+            // to zero.
+            double centroid_drift_l2 = 0.0;
+            partition_manager_->update_centroid(partition_id, new_centroids_buffer,
+                                                &centroid_drift_l2);
 
             // Get hit count and hit rate for the partition.
             int hit_count = aggregated_hits[partition_id];
@@ -113,82 +120,75 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
             if (consider_partition_for_delete) {
 
                 if (params_->enable_delete_rejection && partition_size > params_->min_partition_size) {
-                    // check the assignments of the partitions to be deleted.
+                    // Centroid-only delete-rejection check.
+                    //
+                    // Original implementation: reconstruct every vector in
+                    // the partition to FP32, search the parent for top-2
+                    // candidates per vector, aggregate per-destination
+                    // reassignment counts, then recompute delete-delta with
+                    // those counts. For HSSI codecs the per-blob decode
+                    // dominates — observed at 2666 s on v2 anchor_tq2s
+                    // insert_heavy where deletes never actually fire and
+                    // every check ran-and-rejected.
+                    //
+                    // Replacement: search the partition's recorded centroid
+                    // against the parent (k=2) and treat all members as
+                    // migrating to the nearest non-self partition. One
+                    // parent search instead of O(N), zero codec decodes.
+                    //
+                    // Conservatism: assigning all members to a single
+                    // destination overstates concentration in the absorbing
+                    // partition, which raises the recomputed delete cost
+                    // and makes the safeguard *more* likely to reject.
+                    // That's the safe direction for a rejection check —
+                    // it preserves the original guarantee (don't delete
+                    // when the redirection cost is high) and only lets
+                    // through deletes the cost model already favored.
+                    Tensor centroid_t = torch::from_blob(
+                        new_centroids_buffer,
+                        {1, partition_manager_->d()},
+                        torch::kFloat32).clone();
                     auto search_params = make_shared<SearchParams>();
-                    search_params->k = 2; // get the top 2 partitions, ignore the first one as it is the partition itself
+                    search_params->k = 2;
                     search_params->batched_scan = true;
                     search_params->track_hits = false;
-                    Tensor single_partition = torch::tensor({partition_id}, torch::kInt64);
-                    Tensor centroid_t = partition_manager_->parent_->get(single_partition);
-                    float* centroid = centroid_t.data_ptr<float>();
-                    auto partition =
-                        partition_manager_->partition_store_->get_partition(partition_id);
-                    unordered_map<int64_t, int64_t> reassign_count_map;
-                    constexpr int64_t kDeleteRejectChunkVectors = 4096;
-                    int64_t chunk_capacity = std::max<int64_t>(
-                        1, std::min<int64_t>(kDeleteRejectChunkVectors,
-                                             partition->num_vectors_));
-                    Tensor chunk_vectors = torch::empty(
-                        {chunk_capacity, partition_manager_->d()}, torch::kFloat32);
-                    const int code_size =
-                        partition_manager_->representation_->code_size_bytes();
-                    for (int64_t offset = 0; offset < partition->num_vectors_;
-                         offset += chunk_capacity) {
-                        int chunk_n = static_cast<int>(
-                            std::min<int64_t>(
-                                chunk_capacity, partition->num_vectors_ - offset));
-                        partition_manager_->representation_
-                            ->reconstruct_batch_for_maintenance(
-                                centroid,
-                                partition->codes_ + offset * code_size,
-                                chunk_n,
-                                chunk_vectors.data_ptr<float>());
-                        auto res = partition_manager_->parent_->search(
-                            chunk_vectors.narrow(0, 0, chunk_n), search_params);
-                        Tensor reassign_ids = res->ids.flatten();
-                        auto reassign_accessor =
-                            reassign_ids.accessor<int64_t, 1>();
-                        for (int64_t idx = 0; idx < reassign_ids.size(0); ++idx) {
-                            int64_t reassign_id = reassign_accessor[idx];
-                            if (reassign_id != partition_id && reassign_id >= 0) {
-                                reassign_count_map[reassign_id]++;
-                            }
+                    auto res = partition_manager_->parent_->search(
+                        centroid_t, search_params);
+                    Tensor reassign_ids = res->ids.flatten();
+                    int64_t target = -1;
+                    for (int64_t i = 0; i < reassign_ids.size(0); ++i) {
+                        int64_t cand = reassign_ids[i].item<int64_t>();
+                        if (cand != partition_id && cand >= 0) {
+                            target = cand;
+                            break;
                         }
                     }
-
-                    vector<int64_t> reassign_id_vec;
-                    vector<int64_t> reassign_counts;
-                    reassign_id_vec.reserve(reassign_count_map.size());
-                    reassign_counts.reserve(reassign_count_map.size());
-                    for (const auto& entry : reassign_count_map) {
-                        reassign_id_vec.push_back(entry.first);
-                        reassign_counts.push_back(entry.second);
-                    }
-
-                    Tensor uniques = torch::from_blob(
-                        reassign_id_vec.data(),
-                        {static_cast<int64_t>(reassign_id_vec.size())},
-                        torch::kInt64).clone();
-                    Tensor part_sizes = partition_manager_->get_partition_sizes(uniques);
-
-                    vector<int64_t> reassign_sizes = vector<int64_t>(
-                        part_sizes.data_ptr<int64_t>(),
-                        part_sizes.data_ptr<int64_t>() + part_sizes.size(0));
-                    vector<float> hit_rates;
-                    for (int64_t reassign_id: reassign_id_vec) {
-                        hit_rates.push_back(static_cast<float>(aggregated_hits[reassign_id]) / static_cast<float>(params_->window_size));
-                    }
-
-                    float delta = cost_estimator_->compute_delete_delta_w_reassign(partition_manager_->get_partition_size(partition_id),
-                                                                                  static_cast<float>(aggregated_hits[partition_id]) / static_cast<float>(params_->window_size),
-                                                                                  total_partitions,
-                                                                                  reassign_counts,
-                                                                                  reassign_sizes,
-                                                                                  hit_rates);
-
-                    if (delta < -params_->delete_threshold_ns) {
-                        choose_partition = true;
-                        partitions_to_delete.push_back(partition_id);
+                    if (target >= 0) {
+                        Tensor uniques = torch::tensor({target}, torch::kInt64);
+                        Tensor part_sizes =
+                            partition_manager_->get_partition_sizes(uniques);
+                        vector<int64_t> reassign_counts = {
+                            static_cast<int64_t>(partition_size)
+                        };
+                        vector<int64_t> reassign_sizes = vector<int64_t>(
+                            part_sizes.data_ptr<int64_t>(),
+                            part_sizes.data_ptr<int64_t>() + part_sizes.size(0));
+                        vector<float> hit_rates = {
+                            static_cast<float>(aggregated_hits[target]) /
+                            static_cast<float>(params_->window_size)
+                        };
+                        float delta = cost_estimator_->compute_delete_delta_w_reassign(
+                            partition_manager_->get_partition_size(partition_id),
+                            static_cast<float>(aggregated_hits[partition_id]) /
+                                static_cast<float>(params_->window_size),
+                            total_partitions,
+                            reassign_counts,
+                            reassign_sizes,
+                            hit_rates);
+                        if (delta < -params_->delete_threshold_ns) {
+                            choose_partition = true;
+                            partitions_to_delete.push_back(partition_id);
+                        }
                     }
                 } else {
                     partitions_to_delete.push_back(partition_id);
@@ -214,10 +214,12 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                     }
                     effective_split_threshold *= representation_multiplier;
                     bool should_split = split_delta < -effective_split_threshold;
+                    bool uncertainty_computed = false;
+                    MaintenanceUncertaintyStats uncertainty;
                     if (should_split && params_->enable_quantization_uncertainty) {
-                        MaintenanceUncertaintyStats uncertainty =
-                            partition_manager_->estimate_uncertainty(
-                                partition_id, new_centroids_buffer);
+                        uncertainty = partition_manager_->estimate_uncertainty(
+                            partition_id, new_centroids_buffer);
+                        uncertainty_computed = true;
                         const double rel_error = uncertainty.relative_error();
                         const bool has_quantization_noise =
                             uncertainty.sum_error_l2 > 0.0;
@@ -236,6 +238,38 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                         should_split =
                             !uncertainty_too_high &&
                             split_delta < -effective_split_threshold;
+                    }
+                    // Recall-driven split trigger. Bypasses the cost-model
+                    // multiplier and uncertainty gate, on the principle that
+                    // when the partition's centroid moved significantly this
+                    // maintenance pass (because inserts shifted the member
+                    // distribution off-center), splitting recovers geometric
+                    // correctness even if the latency cost-delta doesn't
+                    // justify it. Required for codecs under inserts: their
+                    // compression² threshold otherwise suppresses all splits
+                    // and the index drifts indefinitely.
+                    //
+                    // The signal is centroid_drift_l2 (how far the centroid
+                    // moved during update_centroid above), normalized by the
+                    // partition's mean radius² to produce a unitless ratio.
+                    // Codec-noise-tolerant: codec error contributes
+                    // proportionally to numerator and denominator.
+                    if (params_->partition_drift_split_threshold > 0.0f &&
+                        centroid_drift_l2 > 0.0) {
+                        if (!uncertainty_computed) {
+                            uncertainty = partition_manager_->estimate_uncertainty(
+                                partition_id, new_centroids_buffer);
+                            uncertainty_computed = true;
+                        }
+                        const double mean_radius_l2 = uncertainty.mean_radius_l2();
+                        const double rel_drift = mean_radius_l2 > 0.0
+                            ? centroid_drift_l2 / mean_radius_l2
+                            : 0.0;
+                        if (rel_drift >
+                            static_cast<double>(
+                                params_->partition_drift_split_threshold)) {
+                            should_split = true;
+                        }
                     }
                     if constexpr(debug_) std::cout << "For partition " << partition_id << " of size " << partition_size << " got split delta " << split_delta << " leading to split decision of " << should_split << std::endl;
                     if (should_split) {

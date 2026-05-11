@@ -1161,6 +1161,25 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
     timing->boundary_distance_time_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
+    // Codec-aware APS radius inflation (Path B). The K-th order statistic of
+    // noisy decoded distances biases the heap pivot below the true K-th
+    // neighbor distance by ~σ_d, where σ_d is a constant of the codec
+    // (analytic from the residual quantizer's reconstruction variance).
+    // Inflate the radius by α·σ_d so the cap-volume model sees a radius
+    // that's calibrated against true distances.
+    //
+    // σ_d comes from the *leaf* representation (this->partition_manager_),
+    // which holds the codec-encoded vectors. The parent_ representation
+    // holds centroids (FP32) and reports σ_d=0.
+    float aps_radius_offset = 0.0f;
+    if (use_aps && metric_ == faiss::METRIC_L2 &&
+        search_params->aps_codec_inflation_alpha > 0.0f &&
+        partition_manager_ && partition_manager_->representation_) {
+        const float sigma_d =
+            partition_manager_->representation_->decoded_distance_stddev();
+        aps_radius_offset = search_params->aps_codec_inflation_alpha * sigma_d;
+    }
+
     timing->aps_time_ns = 0;
     while (total_left_.load(std::memory_order_relaxed) > 0) {
         std::this_thread::sleep_for(std::chrono::microseconds(search_params->aps_flush_period_us));
@@ -1174,6 +1193,10 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
                 if (!query_done && n_left < partition_ids.size(1)) {
 
                     float query_radius = query_dist_pivots_[q].load(std::memory_order_relaxed);
+                    if (aps_radius_offset > 0.0f &&
+                        std::isfinite(query_radius)) {
+                        query_radius += aps_radius_offset;
+                    }
 
                     // check if the query radius has changed
                     float rel_difference = std::abs((curr_radii[q] - query_radius) / query_radius);
@@ -1617,6 +1640,18 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
     bool is_descending = (metric_ == faiss::METRIC_INNER_PRODUCT);
     bool use_aps = (search_params->recall_target > 0.0 && parent_);
 
+    // Codec-aware APS radius inflation: see drain_and_apply_aps for the
+    // derivation. Compute once outside the parallel_for since σ_d is a
+    // codec-level constant, not per-query.
+    float aps_radius_offset = 0.0f;
+    if (use_aps && metric_ == faiss::METRIC_L2 &&
+        search_params->aps_codec_inflation_alpha > 0.0f &&
+        partition_manager_ && partition_manager_->representation_) {
+        const float sigma_d =
+            partition_manager_->representation_->decoded_distance_stddev();
+        aps_radius_offset = search_params->aps_codec_inflation_alpha * sigma_d;
+    }
+
     // Ensure partition_ids is 2D.
     if (partition_ids.dim() == 1) {
         partition_ids = partition_ids.unsqueeze(0).expand({num_queries, partition_ids.size(0)});
@@ -1696,6 +1731,9 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
             scanned_ids.push_back(pi);
 
             float curr_radius = topk_buf->get_kth_distance();
+            if (aps_radius_offset > 0.0f && std::isfinite(curr_radius)) {
+                curr_radius += aps_radius_offset;
+            }
             float percent_change = abs(curr_radius - query_radius) / curr_radius;
 
             auto end_time = high_resolution_clock::now();
