@@ -189,18 +189,6 @@ struct MaintenancePolicyParams {
     // guard and falls back to margin-only inflation.
     float quantization_uncertainty_max_relative_error = -1.0f;
 
-    // Recall-driven split trigger. The latency-only cost model can't see
-    // when a partition has drifted off-center under inserts; under codec
-    // compression its threshold also gets multiplied by compression² so
-    // splits never fire and the index goes stale. This trigger forces a
-    // split when ||c − decode_mean(blobs)||² / mean_radius_l2 exceeds the
-    // threshold, bypassing the cost-model multiplier and uncertainty
-    // gate. Codec-noise-tolerant: codec error contributes proportionally
-    // to numerator and denominator, so the ratio is dominated by genuine
-    // geometric drift. Default 0.0 disables the trigger and preserves
-    // legacy cost-model-only behavior. Reasonable values are 0.1–0.3.
-    float partition_drift_split_threshold = 0.0f;
-
     // SPFresh Param
     int max_partition_size = -1; // -1 means default to standard cost-based maintenance, if set then we use size-based thresholding
 

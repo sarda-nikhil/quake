@@ -146,13 +146,8 @@ public:
     /// write it to the centroid store. |centroid_buffer| (length dim) is
     /// always populated with the post-update centroid (the buffer reflects
     /// the *current* centroid even when there were no new inserts).
-    /// |drift_l2_out|, if non-null, receives the squared L2 distance the
-    /// centroid moved this update — the recall-driven split trigger reads
-    /// this directly because by the time the trigger evaluates, the
-    /// centroid has already been reset to the decoded mean and the
-    /// drift signal is otherwise unrecoverable.
-    int64_t update_centroid(int64_t partition_id, float* centroid_buffer,
-                            double* drift_l2_out = nullptr);
+    /// Returns the delta count absorbed by this pass.
+    int64_t update_centroid(int64_t partition_id, float* centroid_buffer);
 
     /**
      * @brief Estimate maintenance uncertainty for a partition.

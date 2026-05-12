@@ -315,15 +315,6 @@ PYBIND11_MODULE(_bindings, m) {
              &MaintenancePolicyParams::quantization_uncertainty_max_relative_error,
              "Hard guard: suppress splits whose relative codec error exceeds "
              "this bound. <=0 disables the guard. default = -1.")
-        .def_readwrite("partition_drift_split_threshold",
-             &MaintenancePolicyParams::partition_drift_split_threshold,
-             "Recall-driven split trigger. When >0, a partition whose "
-             "centroid has drifted from the actual decoded mean of its "
-             "members by more than this fraction of its squared radius "
-             "is force-split, bypassing the cost-model multiplier and "
-             "uncertainty gate. Required for codecs under inserts to "
-             "stay adaptive. Reasonable values 0.1–0.3. default = 0 "
-             "(disabled, legacy cost-model-only behavior).")
         .def("__repr__", [](const MaintenancePolicyParams &m) {
             std::ostringstream oss;
             oss << "{";

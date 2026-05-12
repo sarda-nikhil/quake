@@ -97,14 +97,7 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
             // Update the centroid for this vector if we have a delta
             bool choose_partition = false;
             float delete_factor = partition_manager_->get_delete_factor(partition_id);
-            // |centroid_drift_l2| captures how far the centroid moved during
-            // this update — the recall-driven split trigger reads it because
-            // by the time estimate_uncertainty runs the centroid has been
-            // reset to the decoded mean and ||c − decode_mean|| has collapsed
-            // to zero.
-            double centroid_drift_l2 = 0.0;
-            partition_manager_->update_centroid(partition_id, new_centroids_buffer,
-                                                &centroid_drift_l2);
+            partition_manager_->update_centroid(partition_id, new_centroids_buffer);
 
             // Get hit count and hit rate for the partition.
             int hit_count = aggregated_hits[partition_id];
@@ -238,38 +231,6 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                         should_split =
                             !uncertainty_too_high &&
                             split_delta < -effective_split_threshold;
-                    }
-                    // Recall-driven split trigger. Bypasses the cost-model
-                    // multiplier and uncertainty gate, on the principle that
-                    // when the partition's centroid moved significantly this
-                    // maintenance pass (because inserts shifted the member
-                    // distribution off-center), splitting recovers geometric
-                    // correctness even if the latency cost-delta doesn't
-                    // justify it. Required for codecs under inserts: their
-                    // compression² threshold otherwise suppresses all splits
-                    // and the index drifts indefinitely.
-                    //
-                    // The signal is centroid_drift_l2 (how far the centroid
-                    // moved during update_centroid above), normalized by the
-                    // partition's mean radius² to produce a unitless ratio.
-                    // Codec-noise-tolerant: codec error contributes
-                    // proportionally to numerator and denominator.
-                    if (params_->partition_drift_split_threshold > 0.0f &&
-                        centroid_drift_l2 > 0.0) {
-                        if (!uncertainty_computed) {
-                            uncertainty = partition_manager_->estimate_uncertainty(
-                                partition_id, new_centroids_buffer);
-                            uncertainty_computed = true;
-                        }
-                        const double mean_radius_l2 = uncertainty.mean_radius_l2();
-                        const double rel_drift = mean_radius_l2 > 0.0
-                            ? centroid_drift_l2 / mean_radius_l2
-                            : 0.0;
-                        if (rel_drift >
-                            static_cast<double>(
-                                params_->partition_drift_split_threshold)) {
-                            should_split = true;
-                        }
                     }
                     if constexpr(debug_) std::cout << "For partition " << partition_id << " of size " << partition_size << " got split delta " << split_delta << " leading to split decision of " << should_split << std::endl;
                     if (should_split) {
