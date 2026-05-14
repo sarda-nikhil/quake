@@ -872,7 +872,12 @@ void HssiPartitionRepresentation::scan_partition(
     std::shared_ptr<ScanMajorCacheEntry> scan_cache =
         get_scan_major_cache(storage_key, storage_version, codes, scan_size);
 
-    if (scan_cache != nullptr && !pivots.empty()) {
+    // The fused pivot+hit path is attractive because it avoids writing the
+    // dense nq x list_size distance matrix, but large Anchor-TQ2S APS workload
+    // replay exposed memory corruption in this path after loading a saved
+    // index. Keep the scan-major cache, but route through the dense batched
+    // scan + walk path until the fused hit emitter is hardened separately.
+    if (false && scan_cache != nullptr && !pivots.empty()) {
         thread_local std::vector<float> pivot_squares;
         thread_local std::vector<hssi::ScanHit> hits;
         pivot_squares.resize(static_cast<size_t>(nq));

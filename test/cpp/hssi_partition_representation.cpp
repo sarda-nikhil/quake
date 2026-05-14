@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <cmath>
 #include <filesystem>
 #include <memory>
 #include <random>
@@ -114,16 +115,35 @@ std::string PersistAnchorTQ(const torch::Tensor &train, int dim) {
   return path;
 }
 
+std::string PersistAnchorTQ2S(const torch::Tensor &train, int dim) {
+  hssi::AnchorTQ2SConfig config;
+  config.dim = dim;
+  config.num_anchors = 64;
+  config.anchor_train_sample = static_cast<int>(train.size(0));
+  config.residual_train_sample = static_cast<int>(train.size(0));
+  auto codec = hssi::TrainAnchorWithTQ2S(
+      train.contiguous().data_ptr<float>(),
+      static_cast<int>(train.size(0)), config);
+
+  char buf[L_tmpnam];
+  std::tmpnam(buf);
+  const std::string path = std::string(buf) + ".hssi_anchor_tq2s";
+  codec->Save(path);
+  return path;
+}
+
 std::shared_ptr<QuakeIndex> BuildIndex(const torch::Tensor &x,
                                        const torch::Tensor &ids,
                                        const std::string &representation,
-                                       const std::string &codec_path) {
+                                       const std::string &codec_path,
+                                       int num_workers = 0) {
   auto params = std::make_shared<IndexBuildParams>();
   params->nlist = kNlist;
   params->metric = "l2";
   params->niter = 8;
   params->representation = representation;
   params->hssi_codec_path = codec_path;
+  params->num_workers = num_workers;
   auto index = std::make_shared<QuakeIndex>();
   index->build(x, ids, params);
   return index;
@@ -344,6 +364,115 @@ TEST_F(HssiQuakeIntegration, AnchorTQSurvivesMaintenance) {
   // Allows slack for genuine search-side effects of partition reshape; the
   // compounding-cascade strawman (impl_cascade.md) drops far further.
   EXPECT_GE(post, pre - 0.10f);
+}
+
+TEST_F(HssiQuakeIntegration, AnchorTQProbabilisticSplitGateMaintenanceDoesNotCrash) {
+  auto hssi_index = BuildIndex(data_, ids_, "anchor_tq", codec_path_);
+
+  auto big = MakeClusteredData(/*n=*/kNumVectors + 400, kDim, /*clusters=*/12,
+                               /*spread=*/2.0f, /*noise=*/0.35f, /*seed=*/1);
+  auto add_data = big.slice(/*dim=*/0, /*start=*/kNumVectors,
+                            /*end=*/kNumVectors + 400).contiguous();
+  auto add_ids = torch::arange(kNumVectors, kNumVectors + 400, torch::kInt64);
+  hssi_index->add(add_data, add_ids);
+
+  auto maintenance_params = std::make_shared<MaintenancePolicyParams>();
+  maintenance_params->window_size = 4;
+  maintenance_params->delete_threshold_ns = 1000.0f;
+  maintenance_params->split_threshold_ns = 1.0f;
+  maintenance_params->min_partition_size = 4;
+  maintenance_params->refinement_radius = 0;
+  maintenance_params->enable_quantization_uncertainty = false;
+  maintenance_params->representation_split_threshold_multiplier = 1.0f;
+  maintenance_params->enable_probabilistic_split_gate = true;
+  maintenance_params->min_split_assignment_probability = 0.95f;
+  hssi_index->initialize_maintenance_policy(maintenance_params);
+
+  auto pids = hssi_index->partition_manager_->get_partition_ids();
+  auto pids_accessor = pids.accessor<int64_t, 1>();
+  ASSERT_GT(pids.size(0), 0);
+  const double direct_probability =
+      hssi_index->partition_manager_
+          ->estimate_probabilistic_split_assignment_stability(
+              pids_accessor[0], maintenance_params->split_knn_iterations);
+  EXPECT_TRUE(std::isfinite(direct_probability));
+  EXPECT_GE(direct_probability, 0.0);
+  EXPECT_LE(direct_probability, 1.0);
+
+  // Fill the hit window so the cost-model split path and probabilistic gate
+  // actually execute. Query search records hits through the Quake path used by
+  // workload replay.
+  for (int i = 0; i < maintenance_params->window_size; ++i) {
+    (void)SearchIds(*hssi_index, queries_);
+  }
+
+  shared_ptr<MaintenanceTimingInfo> info = hssi_index->maintenance();
+  ASSERT_NE(info, nullptr);
+  EXPECT_GE(info->n_splits, 0);
+
+  auto ids_after = SearchIds(*hssi_index, queries_);
+  ASSERT_EQ(ids_after.size(0), kNumQueries);
+  ASSERT_EQ(ids_after.size(1), kTopK);
+}
+
+TEST_F(HssiQuakeIntegration, AnchorTQ2SWorkerApsSearchDoesNotCorruptState) {
+  const std::string tq2s_path = PersistAnchorTQ2S(data_, kDim);
+  auto hssi_index = BuildIndex(data_, ids_, "anchor_tq2s", tq2s_path,
+                               /*num_workers=*/4);
+
+  auto sp = std::make_shared<SearchParams>();
+  sp->k = kTopK;
+  sp->recall_target = 0.9f;
+  sp->batched_scan = true;
+  sp->track_hits = true;
+  sp->adaptive_nprobe_multiplier = 4.0f;
+
+  for (int round = 0; round < 20; ++round) {
+    auto result = hssi_index->search(queries_, sp);
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(result->ids.size(0), kNumQueries);
+    ASSERT_EQ(result->ids.size(1), kTopK);
+  }
+
+  std::error_code ec;
+  std::filesystem::remove(tq2s_path, ec);
+}
+
+TEST_F(HssiQuakeIntegration, AnchorTQ2SSaveLoadWorkerApsSearchDoesNotCrash) {
+  const std::string tq2s_path = PersistAnchorTQ2S(data_, kDim);
+  auto index = BuildIndex(data_, ids_, "anchor_tq2s", tq2s_path,
+                          /*num_workers=*/4);
+
+  char buf[L_tmpnam];
+  std::tmpnam(buf);
+  const std::string index_path = std::string(buf) + ".quake_tq2s_index";
+  index->save(index_path);
+
+  auto params = std::make_shared<IndexBuildParams>();
+  params->nlist = kNlist;
+  params->metric = "l2";
+  params->representation = "anchor_tq2s";
+  params->hssi_codec_path = tq2s_path;
+  params->num_workers = 4;
+
+  auto loaded = std::make_shared<QuakeIndex>();
+  loaded->load(index_path, params);
+
+  auto sp = std::make_shared<SearchParams>();
+  sp->k = kTopK;
+  sp->recall_target = 0.9f;
+  sp->batched_scan = true;
+  sp->track_hits = true;
+  sp->adaptive_nprobe_multiplier = 4.0f;
+
+  auto result = loaded->search(queries_, sp);
+  ASSERT_NE(result, nullptr);
+  ASSERT_EQ(result->ids.size(0), kNumQueries);
+  ASSERT_EQ(result->ids.size(1), kTopK);
+
+  std::error_code ec;
+  std::filesystem::remove(tq2s_path, ec);
+  std::filesystem::remove_all(index_path, ec);
 }
 
 }  // namespace
