@@ -54,6 +54,26 @@ PYBIND11_MODULE(_bindings, m) {
         and maintain your index.
     )pbdoc";
 
+    m.def("build_config", []() {
+        py::dict config;
+#ifdef QUAKE_USE_NUMA
+        config["use_numa"] = true;
+#else
+        config["use_numa"] = false;
+#endif
+#ifdef QUAKE_USE_HSSI
+        config["use_hssi"] = true;
+#else
+        config["use_hssi"] = false;
+#endif
+#ifdef QUAKE_ENABLE_GPU
+        config["enable_gpu"] = true;
+#else
+        config["enable_gpu"] = false;
+#endif
+        return config;
+    }, "Return compile-time feature flags for the loaded Quake extension.");
+
     /*********** Index Partition Bindings ***********/
     class_<IndexPartition>(m, "IndexPartition")
         .def_readwrite_static("delete_resize_threshold", &IndexPartition::delete_resize_threshold_)

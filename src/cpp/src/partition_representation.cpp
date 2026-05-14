@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <topk_buffer.h>
+#include "parallel.h"
 #include "faiss/utils/distances.h"
 
 #ifdef _OPENMP
@@ -381,7 +382,8 @@ void Fp32PartitionRepresentation::scan_partition(
     uint64_t /*storage_key*/,
     uint64_t /*storage_version*/,
     const void* /*prepared_queries*/,
-    const void* /*prepared_centroid*/) const {
+    const void* /*prepared_centroid*/,
+    int /*numa_node*/) const {
     (void)ip_block;
     (void)norms_x;
     (void)norms_y;
@@ -622,6 +624,66 @@ void Fp32PartitionRepresentation::save(const string& path) const {
 }
 
 #ifdef QUAKE_USE_HSSI
+HssiPartitionRepresentation::ScanMajorCacheEntry::~ScanMajorCacheEntry() {
+    if (bytes == nullptr) {
+        return;
+    }
+#ifdef QUAKE_USE_NUMA
+    if (numa_node >= 0) {
+        quake_free(bytes, size_bytes);
+    } else
+#endif
+    {
+        std::free(bytes);
+    }
+    bytes = nullptr;
+    size_bytes = 0;
+}
+
+void HssiPartitionRepresentation::ScanMajorCacheEntry::allocate(
+    size_t bytes_to_allocate,
+    int target_numa_node) {
+    if (bytes != nullptr) {
+#ifdef QUAKE_USE_NUMA
+        if (numa_node >= 0) {
+            quake_free(bytes, size_bytes);
+        } else
+#endif
+        {
+            std::free(bytes);
+        }
+    }
+
+    bytes = nullptr;
+    size_bytes = bytes_to_allocate;
+    numa_node = target_numa_node;
+    if (bytes_to_allocate == 0) {
+        return;
+    }
+
+#ifdef QUAKE_USE_NUMA
+    if (target_numa_node >= 0) {
+        bytes = static_cast<uint8_t*>(
+            quake_alloc(bytes_to_allocate, target_numa_node));
+        return;
+    }
+#endif
+
+    bytes = static_cast<uint8_t*>(std::malloc(bytes_to_allocate));
+    if (bytes == nullptr) {
+        throw std::bad_alloc();
+    }
+    std::memset(bytes, 0, bytes_to_allocate);
+}
+
+uint8_t* HssiPartitionRepresentation::ScanMajorCacheEntry::data() {
+    return bytes;
+}
+
+const uint8_t* HssiPartitionRepresentation::ScanMajorCacheEntry::data() const {
+    return bytes;
+}
+
 HssiPartitionRepresentation::HssiPartitionRepresentation(
     shared_ptr<const hssi::Codec> codec,
     hssi::CodecReconstructionMode reconstruction_mode)
@@ -723,7 +785,8 @@ HssiPartitionRepresentation::get_scan_major_cache(
     uint64_t storage_key,
     uint64_t storage_version,
     const uint8_t* codes,
-    int list_size) const {
+    int list_size,
+    int numa_node) const {
     if (storage_key == 0 || !codec_->SupportsScanMajor() || list_size < 8) {
         return nullptr;
     }
@@ -732,16 +795,17 @@ HssiPartitionRepresentation::get_scan_major_cache(
     auto it = scan_major_cache_.find(storage_key);
     if (it != scan_major_cache_.end() &&
         it->second->version == storage_version &&
-        it->second->list_size == list_size) {
+        it->second->list_size == list_size &&
+        it->second->numa_node == numa_node) {
         return it->second;
     }
 
     auto entry = std::make_shared<ScanMajorCacheEntry>();
     entry->version = storage_version;
     entry->list_size = list_size;
-    entry->bytes.resize(static_cast<size_t>(
-        codec_->ScanMajorSizeBytes(list_size)));
-    codec_->BuildScanMajor(codes, list_size, entry->bytes.data());
+    entry->allocate(static_cast<size_t>(codec_->ScanMajorSizeBytes(list_size)),
+                    numa_node);
+    codec_->BuildScanMajor(codes, list_size, entry->data());
     scan_major_cache_[storage_key] = entry;
     return entry;
 }
@@ -772,7 +836,8 @@ void HssiPartitionRepresentation::scan_partition(
     uint64_t storage_key,
     uint64_t storage_version,
     const void* prepared_queries,
-    const void* prepared_centroid) const {
+    const void* prepared_centroid,
+    int numa_node) const {
     (void)ip_block;
     (void)norms_x;
     (void)norms_y;
@@ -842,13 +907,14 @@ void HssiPartitionRepresentation::scan_partition(
         thread_local std::vector<float> distance_squares;
         distance_squares.resize(static_cast<size_t>(list_size));
         std::shared_ptr<ScanMajorCacheEntry> scan_cache =
-            get_scan_major_cache(storage_key, storage_version, codes, scan_size);
+            get_scan_major_cache(
+                storage_key, storage_version, codes, scan_size, numa_node);
         if (scan_cache != nullptr && prep_c_ptr != nullptr) {
             codec_->ScanPartitionPreparedBatchScanMajor(
                 prep_q_ptr,
                 1,
                 prep_c_ptr,
-                scan_cache->bytes.data(),
+                scan_cache->data(),
                 scan_size,
                 distance_squares.data());
         } else if (prep_c_ptr != nullptr) {
@@ -870,7 +936,8 @@ void HssiPartitionRepresentation::scan_partition(
     // (nq × list_size floats) and the second-pass walk_dists. With a
     // cache miss uses the dense scan + walk path.
     std::shared_ptr<ScanMajorCacheEntry> scan_cache =
-        get_scan_major_cache(storage_key, storage_version, codes, scan_size);
+        get_scan_major_cache(
+            storage_key, storage_version, codes, scan_size, numa_node);
 
     // The fused pivot+hit path is attractive because it avoids writing the
     // dense nq x list_size distance matrix, but large Anchor-TQ2S APS workload
@@ -891,7 +958,7 @@ void HssiPartitionRepresentation::scan_partition(
         int num_hits = 0;
         codec_->ScanPartitionPreparedBatchScanMajorHits(
             prep_q_ptr, nq, prep_c_ptr, pivot_squares.data(),
-            scan_cache->bytes.data(), scan_size,
+            scan_cache->data(), scan_size,
             hits.data(),
             static_cast<int>(hits.size()),
             &num_hits);
@@ -910,7 +977,7 @@ void HssiPartitionRepresentation::scan_partition(
     if (scan_cache != nullptr) {
         codec_->ScanPartitionPreparedBatchScanMajor(
             prep_q_ptr, nq, prep_c_ptr,
-            scan_cache->bytes.data(),
+            scan_cache->data(),
             scan_size,
             batched_dists.data());
     } else {

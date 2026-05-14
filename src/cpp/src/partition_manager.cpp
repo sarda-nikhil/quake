@@ -1359,21 +1359,26 @@ void PartitionManager::scan_partition(const float* queries,
         return;
     }
 
-    // Pass precomputed prepared centroid bytes when available. If the
-    // representation does not use prepared centroids, or the slot is not
-    // populated yet after load, provide the raw centroid and let the
-    // representation prepare locally.
-    const uint8_t* prepared_centroid = prepared_centroid_for(partition_id);
-    if (prepared_centroid == nullptr && prepared_centroid_size_bytes() > 0) {
-        ensure_prepared_centroid(partition_id);
-        prepared_centroid = prepared_centroid_for(partition_id);
-    }
-
+    // Prepare centroid into storage owned by this scan call. Earlier versions
+    // lazily populated |prepared_centroids_| here, but this function runs on
+    // worker threads while add/split/refine can mutate partition state. Mutating
+    // the shared cache from the search hot path exposed use-after-free in large
+    // Anchor-TQ2S APS replays. Local preparation is slightly more expensive but
+    // gives each scan a stable centroid buffer and keeps the cache mutation
+    // confined to explicit centroid-update paths.
+    std::vector<uint8_t> prepared_centroid_storage;
+    const uint8_t* prepared_centroid = nullptr;
     vector<float> centroid_buffer(dim_);
     const float* centroid_ptr = nullptr;
-    if (prepared_centroid == nullptr &&
-        get_partition_centroid(partition_id, centroid_buffer.data())) {
+    if (get_partition_centroid(partition_id, centroid_buffer.data())) {
         centroid_ptr = centroid_buffer.data();
+        if (prepared_centroid_size_bytes() > 0 && representation_ != nullptr) {
+            prepared_centroid_storage.resize(
+                static_cast<size_t>(prepared_centroid_size_bytes()));
+            representation_->prepare_centroid(
+                centroid_ptr, prepared_centroid_storage.data());
+            prepared_centroid = prepared_centroid_storage.data();
+        }
     }
 
     representation_->scan_partition(
@@ -1394,7 +1399,8 @@ void PartitionManager::scan_partition(const float* queries,
         partition->storage_generation_,
         partition->mutation_version_,
         prepared_queries,
-        prepared_centroid);
+        prepared_centroid,
+        partition->numa_node_);
 }
 
 Tensor PartitionManager::get_partition_ids() {

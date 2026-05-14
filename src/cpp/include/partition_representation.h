@@ -113,7 +113,8 @@ public:
                                 uint64_t storage_key = 0,
                                 uint64_t storage_version = 0,
                                 const void* prepared_queries = nullptr,
-                                const void* prepared_centroid = nullptr) const = 0;
+                                const void* prepared_centroid = nullptr,
+                                int numa_node = -1) const = 0;
 
     /**
      * @brief Reconstruct one payload into FP32 for get()/maintenance.
@@ -249,7 +250,8 @@ public:
                         uint64_t storage_key = 0,
                         uint64_t storage_version = 0,
                         const void* prepared_queries = nullptr,
-                        const void* prepared_centroid = nullptr) const override;
+                        const void* prepared_centroid = nullptr,
+                        int numa_node = -1) const override;
 
     void reconstruct(const float* centroid,
                      const uint8_t* code,
@@ -347,7 +349,8 @@ public:
                         uint64_t storage_key = 0,
                         uint64_t storage_version = 0,
                         const void* prepared_queries = nullptr,
-                        const void* prepared_centroid = nullptr) const override;
+                        const void* prepared_centroid = nullptr,
+                        int numa_node = -1) const override;
 
     void reconstruct(const float* centroid,
                      const uint8_t* code,
@@ -377,9 +380,20 @@ public:
 
 private:
     struct ScanMajorCacheEntry {
+        ScanMajorCacheEntry() = default;
+        ScanMajorCacheEntry(const ScanMajorCacheEntry&) = delete;
+        ScanMajorCacheEntry& operator=(const ScanMajorCacheEntry&) = delete;
+        ~ScanMajorCacheEntry();
+
         uint64_t version = 0;
         int64_t list_size = 0;
-        std::vector<uint8_t> bytes;
+        int numa_node = -1;
+        size_t size_bytes = 0;
+        uint8_t* bytes = nullptr;
+
+        void allocate(size_t bytes_to_allocate, int target_numa_node);
+        uint8_t* data();
+        const uint8_t* data() const;
     };
 
     shared_ptr<const hssi::Codec> codec_;
@@ -393,7 +407,8 @@ private:
         uint64_t storage_key,
         uint64_t storage_version,
         const uint8_t* codes,
-        int list_size) const;
+        int list_size,
+        int numa_node) const;
 };
 
 shared_ptr<PartitionRepresentation> MakeHssiPartitionRepresentation(
