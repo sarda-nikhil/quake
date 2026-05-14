@@ -315,6 +315,15 @@ PYBIND11_MODULE(_bindings, m) {
              &MaintenancePolicyParams::quantization_uncertainty_max_relative_error,
              "Hard guard: suppress splits whose relative codec error exceeds "
              "this bound. <=0 disables the guard. default = -1.")
+        .def_readwrite("enable_probabilistic_split_gate",
+             &MaintenancePolicyParams::enable_probabilistic_split_gate,
+             "When true, cost-model split candidates are dry-run and accepted "
+             "only if their expected FP32 assignment agreement exceeds "
+             "min_split_assignment_probability. default = false.")
+        .def_readwrite("min_split_assignment_probability",
+             &MaintenancePolicyParams::min_split_assignment_probability,
+             "Minimum mean probability that true FP32 assignments agree with "
+             "the reconstructed split assignments. default = 0.5.")
         .def("__repr__", [](const MaintenancePolicyParams &m) {
             std::ostringstream oss;
             oss << "{";

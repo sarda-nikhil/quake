@@ -9,6 +9,7 @@
 #include "partition_manager.h"
 #include "clustering.h"
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <iostream>
 #include "parallel.h"
@@ -868,6 +869,139 @@ MaintenanceUncertaintyStats PartitionManager::estimate_uncertainty(
         centroid,
         partition->codes_,
         static_cast<int>(partition->num_vectors_));
+}
+
+double PartitionManager::estimate_probabilistic_split_assignment_stability(
+    int64_t partition_id,
+    int knn_iteration) {
+    if (representation_ == nullptr || partition_store_ == nullptr) {
+        return 1.0;
+    }
+    std::shared_ptr<IndexPartition> source_partition =
+        partition_store_->get_partition(partition_id);
+    if (source_partition == nullptr || source_partition->num_vectors_ < 2) {
+        return 1.0;
+    }
+
+    const int d = dim_;
+    const int code_size = representation_->code_size_bytes();
+    const int64_t list_size = source_partition->num_vectors_;
+    const int iterations = knn_iteration > 0 ? knn_iteration : 1;
+
+    std::vector<float> source_centroid(d, 0.0f);
+    if (!get_partition_centroid(partition_id, source_centroid.data())) {
+        std::fill(source_centroid.begin(), source_centroid.end(), 0.0f);
+    }
+
+    std::vector<float> c0(d, 0.0f);
+    std::vector<float> c1(d, 0.0f);
+    representation_->reconstruct(
+        source_centroid.data(), source_partition->codes_, c0.data());
+    representation_->reconstruct(
+        source_centroid.data(),
+        source_partition->codes_ + (list_size - 1) * code_size,
+        c1.data());
+
+    constexpr int64_t kSplitChunkVectors = 4096;
+    const int64_t chunk_capacity =
+        std::max<int64_t>(1, std::min<int64_t>(kSplitChunkVectors, list_size));
+    std::vector<float> candidates(static_cast<size_t>(2) * d);
+    std::vector<float> sums(static_cast<size_t>(2) * d);
+    std::vector<int64_t> counts(2);
+
+    for (int iter = 0; iter < iterations; ++iter) {
+        std::copy(c0.begin(), c0.end(), candidates.begin());
+        std::copy(c1.begin(), c1.end(), candidates.begin() + d);
+        std::fill(sums.begin(), sums.end(), 0.0f);
+        std::fill(counts.begin(), counts.end(), 0);
+
+        for (int64_t offset = 0; offset < list_size; offset += chunk_capacity) {
+            const int chunk_n = static_cast<int>(
+                std::min<int64_t>(chunk_capacity, list_size - offset));
+            const uint8_t* chunk_codes =
+                source_partition->codes_ + offset * code_size;
+            representation_->assign_to_centroids_and_accumulate(
+                source_centroid.data(),
+                chunk_codes,
+                chunk_n,
+                candidates.data(),
+                2,
+                parent_->metric_,
+                nullptr,
+                sums.data(),
+                counts.data());
+        }
+
+        for (int split = 0; split < 2; ++split) {
+            if (counts[split] == 0) {
+                continue;
+            }
+            float* dst = split == 0 ? c0.data() : c1.data();
+            const float* sum = sums.data() + split * d;
+            const float inv_count = 1.0f / static_cast<float>(counts[split]);
+            for (int j = 0; j < d; ++j) {
+                dst[j] = sum[j] * inv_count;
+            }
+        }
+    }
+
+    double separation_l2 = 0.0;
+    for (int j = 0; j < d; ++j) {
+        const double diff = static_cast<double>(c1[j]) - c0[j];
+        separation_l2 += diff * diff;
+    }
+    const double separation = std::sqrt(separation_l2);
+    if (separation <= 1e-12) {
+        return 0.0;
+    }
+
+    auto normal_cdf = [](double z) {
+        return 0.5 * (1.0 + std::erf(z / std::sqrt(2.0)));
+    };
+
+    std::vector<float> scratch(d);
+    double probability_sum = 0.0;
+    int64_t probability_count = 0;
+    for (int64_t offset = 0; offset < list_size; offset += chunk_capacity) {
+        const int chunk_n = static_cast<int>(
+            std::min<int64_t>(chunk_capacity, list_size - offset));
+        for (int row = 0; row < chunk_n; ++row) {
+            const uint8_t* code =
+                source_partition->codes_ +
+                (offset + row) * static_cast<int64_t>(code_size);
+            representation_->reconstruct(
+                source_centroid.data(), code, scratch.data());
+            double d0 = 0.0;
+            double d1 = 0.0;
+            for (int j = 0; j < d; ++j) {
+                const double diff0 =
+                    static_cast<double>(scratch[j]) - c0[j];
+                const double diff1 =
+                    static_cast<double>(scratch[j]) - c1[j];
+                d0 += diff0 * diff0;
+                d1 += diff1 * diff1;
+            }
+            const double margin = std::fabs(d1 - d0);
+            MaintenanceUncertaintyStats stats =
+                representation_->estimate_uncertainty(
+                    source_centroid.data(), code, 1);
+            const double sigma_coord = std::sqrt(
+                std::max(0.0, stats.mean_error_l2()) /
+                static_cast<double>(std::max(1, d)));
+            if (sigma_coord <= 1e-12) {
+                probability_sum += 1.0;
+            } else {
+                const double z =
+                    margin / std::max(2.0 * sigma_coord * separation, 1e-12);
+                probability_sum += normal_cdf(z);
+            }
+            ++probability_count;
+        }
+    }
+
+    return probability_count > 0
+        ? probability_sum / static_cast<double>(probability_count)
+        : 1.0;
 }
 
 void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {

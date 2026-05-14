@@ -189,6 +189,16 @@ struct MaintenancePolicyParams {
     // guard and falls back to margin-only inflation.
     float quantization_uncertainty_max_relative_error = -1.0f;
 
+    // Probabilistic split-stability gate. When enabled, a cost-model split
+    // candidate is accepted only if the expected fraction of FP32 assignments
+    // that agree with the reconstructed split assignment exceeds this
+    // threshold. The estimate treats each code's quantization error as
+    // isotropic Gaussian with variance error_l2 / dim, projected onto the
+    // proposed child-centroid decision boundary. This is a pure veto: rejected
+    // candidates do not refresh centroids, reassign vectors, or rewrite blobs.
+    bool enable_probabilistic_split_gate = false;
+    float min_split_assignment_probability = 0.5f;
+
     // SPFresh Param
     int max_partition_size = -1; // -1 means default to standard cost-based maintenance, if set then we use size-based thresholding
 

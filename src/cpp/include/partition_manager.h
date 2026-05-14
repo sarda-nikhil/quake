@@ -156,6 +156,19 @@ public:
                                                      const float* centroid);
 
     /**
+     * @brief Estimate expected FP32 assignment stability for a proposed binary
+     * split without mutating the index.
+     *
+     * The helper runs the same reconstructed-space binary k-means used by
+     * split_partitions, then models each decoded vector as x_hat + e with
+     * isotropic projected variance derived from representation uncertainty.
+     * Returns mean_i P(true assignment agrees with reconstructed assignment).
+     */
+    double estimate_probabilistic_split_assignment_stability(
+        int64_t partition_id,
+        int knn_iteration = DEFAULT_NITER);
+
+    /**
      * @brief Select partitions and their centroids.
      * @param partition_ids Tensor of shape [num_partitions] containing partition IDs.
      * @param copy If true, copies the data; otherwise, uses references.

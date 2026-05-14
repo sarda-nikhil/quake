@@ -232,6 +232,18 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                             !uncertainty_too_high &&
                             split_delta < -effective_split_threshold;
                     }
+                    if (should_split &&
+                        params_->enable_probabilistic_split_gate) {
+                        const double assignment_probability =
+                            partition_manager_
+                                ->estimate_probabilistic_split_assignment_stability(
+                                    partition_id,
+                                    params_->split_knn_iterations);
+                        should_split =
+                            assignment_probability >=
+                            static_cast<double>(
+                                params_->min_split_assignment_probability);
+                    }
                     if constexpr(debug_) std::cout << "For partition " << partition_id << " of size " << partition_size << " got split delta " << split_delta << " leading to split decision of " << should_split << std::endl;
                     if (should_split) {
                         split_candidates.emplace_back(partition_id, split_delta);
