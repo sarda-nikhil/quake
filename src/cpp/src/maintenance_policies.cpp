@@ -192,6 +192,11 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                 if (partition_size > params_->min_partition_size) {
                     float split_delta = cost_estimator_->compute_split_delta(
                         partition_size, hit_rate, total_partitions);
+                    if (params_->split_rewrite_cost_ns_per_vector > 0.0f) {
+                        split_delta +=
+                            params_->split_rewrite_cost_ns_per_vector *
+                            static_cast<float>(partition_size);
+                    }
                     float effective_split_threshold = params_->split_threshold_ns;
                     float representation_multiplier =
                         params_->representation_split_threshold_multiplier;

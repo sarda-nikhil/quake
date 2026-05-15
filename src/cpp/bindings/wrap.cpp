@@ -311,6 +311,10 @@ PYBIND11_MODULE(_bindings, m) {
              &MaintenancePolicyParams::representation_split_threshold_multiplier,
              "Codec-aware split-threshold multiplier. <=0 uses the active "
              "representation's default (FP32: 1.0; HSSI: representation-specific).")
+        .def_readwrite("split_rewrite_cost_ns_per_vector",
+             &MaintenancePolicyParams::split_rewrite_cost_ns_per_vector,
+             "Amortized rewrite cost added to split_delta per vector touched "
+             "by a split. Default 0 preserves the original cost model.")
         .def_readwrite("refinement_nprobe", &MaintenancePolicyParams::refinement_nprobe,
              "nprobe used by local refinement neighbor search. default = 1000.")
         .def_readwrite("max_refine_partitions_per_maintenance",

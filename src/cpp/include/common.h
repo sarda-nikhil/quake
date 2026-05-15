@@ -170,6 +170,13 @@ struct MaintenancePolicyParams {
     // default). >0 overrides everywhere.
     float representation_split_threshold_multiplier = -1.0f;
 
+    // Amortized rewrite cost for executing a split, expressed in the same
+    // expected-query-latency units as split_delta. This decelerates codecs whose
+    // split/re-encode work is substantially more expensive than FP32 by adding
+    // partition_size * split_rewrite_cost_ns_per_vector to the split delta.
+    // Default 0 preserves Quake's original latency-only split predicate.
+    float split_rewrite_cost_ns_per_vector = 0.0f;
+
     // Local-refinement bounding. Pre-tuning Quake hard-coded nprobe=1000 and
     // ran refinement over an unbounded ball of neighbors around each split
     // child; encoded representations need both knobs tunable to keep
