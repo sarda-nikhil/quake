@@ -94,6 +94,7 @@ constexpr float DEFAULT_ADAPTIVE_NPROBE_MULTIPLIER = 1.0f; ///< Multiplier appli
 constexpr float DEFAULT_RECOMPUTE_THRESHOLD = 0.001f;    ///< Default threshold to trigger recomputation of search parameters.
 constexpr int DEFAULT_APS_FLUSH_PERIOD_US = 5;         ///< Default period (in microseconds) for flushing the APS buffer.
 constexpr float DEFAULT_APS_CODEC_INFLATION_ALPHA = 0.0f; ///< Multiplier on codec σ_d for APS radius inflation. 0 disables (FP32-equivalent).
+constexpr int DEFAULT_STABLE_RERANK_K = 0;               ///< Candidate budget M for anchor rerank. 0 (default) disables; >k enlarges the residual heap to top-M, then reranks by stable distance to top-k. See spec/anchor_rerank.md.
 constexpr int MAX_SUBBATCH = 128;
 constexpr int MIN_BATCH_SCAN_SIZE = 4; ///< Minimum batch size for scanning partitions.
 constexpr int BLAS_DB_BS = 256;
@@ -206,6 +207,21 @@ struct MaintenancePolicyParams {
     bool enable_probabilistic_split_gate = false;
     float min_split_assignment_probability = 0.5f;
 
+    // Anchor-view split telemetry (spec/anchor_rerank.md §"Anchor-Based Split
+    // Maintenance"). When enabled, each cost-model split candidate is dry-run in
+    // the codec's stable reconstruction space and the resulting signals are
+    // exported on MaintenanceTimingInfo. This is intentionally telemetry-only:
+    // it never vetoes, forces, refreshes, reassigns, or rewrites a partition.
+    //
+    // enable_anchor_split_validation is kept as a deprecated compatibility alias
+    // for older scripts; it has the same telemetry-only behavior.
+    bool enable_anchor_split_telemetry = false;
+    bool enable_anchor_split_validation = false;
+    // Deprecated threshold annotations kept for CLI compatibility. The
+    // telemetry path records raw values and never compares against these.
+    float min_anchor_distortion_drop_frac = 0.05f;
+    float max_anchor_assignment_disagreement = 0.20f;
+
     // SPFresh Param
     int max_partition_size = -1; // -1 means default to standard cost-based maintenance, if set then we use size-based thresholding
 
@@ -280,6 +296,7 @@ struct SearchParams {
     int batch_size = MAX_SUBBATCH;
 
     bool track_hits = true;
+    bool collect_scanned_partition_ids = false;
     bool scan_all = false;
 
     // APS params
@@ -299,6 +316,25 @@ struct SearchParams {
     float aps_codec_inflation_alpha = DEFAULT_APS_CODEC_INFLATION_ALPHA;
     int sample_prefix = 0;
     int sample_stride = 10;
+
+    // Anchor rerank (spec/anchor_rerank.md). When > k AND the leaf
+    // representation reports supports_stable_rerank()=true, search uses
+    // stable_rerank_k as the residual-heap depth instead of k; once
+    // aggregation completes, each candidate's stable distance is
+    // computed and the final top-k is selected by stable distance.
+    // 0 disables — the legacy residual-only ranking is used.
+    int stable_rerank_k = DEFAULT_STABLE_RERANK_K;
+    // Optional residual/anchor score mixing for stable rerank:
+    // score = stable_distance_l2sq + stable_rerank_residual_weight *
+    //         residual_candidate_distance_l2sq.
+    // Default 0 preserves anchor-only rerank.
+    float stable_rerank_residual_weight = 0.0f;
+    // Optional in-memory rerank score sweep, evaluated from the same residual
+    // top-M candidate pool and anchor-distance pass. These do not affect the
+    // primary ids/distances result.
+    vector<float> rerank_sweep_raw_weights;
+    vector<float> rerank_sweep_z_weights;
+    vector<float> rerank_sweep_rank_weights;
 
     // Auncel params
     bool use_auncel = false;
@@ -343,9 +379,10 @@ struct ModifyTimingInfo {
  * @brief Structure to hold timing information for search operations.
  */
 struct SearchTimingInfo {
-    int64_t n_queries; ///< Number of queries.
-    int64_t n_clusters; ///< Number of clusters (nlist).
-    int partitions_scanned; ///< Number of partitions scanned.
+    int64_t n_queries = 0; ///< Number of queries.
+    int64_t n_clusters = 0; ///< Number of clusters (nlist).
+    int partitions_scanned = 0; ///< Number of partitions scanned.
+    vector<vector<int64_t>> scanned_partition_ids; ///< Scanned partition IDs per query.
     shared_ptr<SearchParams> search_params = nullptr; ///< Search parameters.
     shared_ptr<SearchTimingInfo> parent_info = nullptr; ///< Timing info for the parent index, if any.
 
@@ -387,21 +424,36 @@ struct SearchTimingInfo {
  * @brief Structure to hold timing information for maintenance operations.
  */
 struct MaintenanceTimingInfo {
-    int64_t n_splits; ///< Number of splits.
-    int64_t n_deletes; ///< Number of merges.
-    int64_t n_recluster; ///< Number of reclusters
+    int64_t n_splits = 0; ///< Number of splits.
+    int64_t n_deletes = 0; ///< Number of merges.
+    int64_t n_recluster = 0; ///< Number of reclusters
 
-    int64_t delete_time_us; ///< Time spent on deletions in microseconds.
-    int64_t split_time_us; ///< Time spent on splits in microseconds.
-    int64_t refinement_time_us; ///< Time spent on refinement in microseconds.
-    int64_t recluster_time_us; ///< Time spent on reclustering
-    int64_t total_time_us; ///< Total time spent in microseconds.
+    // Anchor-view split telemetry. These counters summarize cost-model split
+    // candidates before max_splits_per_maintenance trimming. They do not affect
+    // whether a split executes.
+    int64_t n_split_candidates = 0;
+    int64_t n_anchor_split_telemetry_candidates = 0;
+    double anchor_distortion_drop_frac_sum = 0.0;
+    double anchor_distortion_drop_frac_min = 0.0;
+    double anchor_distortion_drop_frac_max = 0.0;
+    double anchor_assignment_disagreement_bound_sum = 0.0;
+    double anchor_assignment_disagreement_bound_max = 0.0;
+    double anchor_mean_error_sum = 0.0;
+
+    int64_t delete_time_us = 0; ///< Time spent on deletions in microseconds.
+    int64_t split_time_us = 0; ///< Time spent on splits in microseconds.
+    int64_t refinement_time_us = 0; ///< Time spent on refinement in microseconds.
+    int64_t recluster_time_us = 0; ///< Time spent on reclustering
+    int64_t total_time_us = 0; ///< Total time spent in microseconds.
 };
 
 struct SearchResult {
     Tensor ids;
     Tensor distances;
     shared_ptr<SearchTimingInfo> timing_info;
+    vector<string> rerank_variant_names;
+    vector<Tensor> rerank_variant_ids;
+    vector<Tensor> rerank_variant_distances;
 };
 
 struct Clustering {

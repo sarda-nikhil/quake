@@ -6,6 +6,7 @@
 #include <iostream>
 #include <chrono>
 #include <cmath>
+#include <numeric>
 #include <unistd.h>
 #include <partition_manager.h>
 #include <quake_index.h>
@@ -50,6 +51,35 @@ int aps_max_rank_for_target(const vector<float>& recall_profile,
         std::ceil(static_cast<float>(recommended_rank + 1) * effective_multiplier));
     scan_count = std::max(1, std::min(scan_count, num_partitions));
     return scan_count - 1;
+}
+
+float percentile_sorted(const std::vector<float>& sorted, double q) {
+    if (sorted.empty()) return 0.0f;
+    const double pos = q * static_cast<double>(sorted.size() - 1);
+    const size_t lo = static_cast<size_t>(std::floor(pos));
+    const size_t hi = static_cast<size_t>(std::ceil(pos));
+    if (lo == hi) return sorted[lo];
+    const double t = pos - static_cast<double>(lo);
+    return static_cast<float>((1.0 - t) * sorted[lo] + t * sorted[hi]);
+}
+
+void robust_center_scale(const std::vector<float>& values,
+                         float& center,
+                         float& scale) {
+    if (values.empty()) {
+        center = 0.0f;
+        scale = 1.0f;
+        return;
+    }
+    std::vector<float> sorted = values;
+    std::sort(sorted.begin(), sorted.end());
+    center = percentile_sorted(sorted, 0.50);
+    const float q25 = percentile_sorted(sorted, 0.25);
+    const float q75 = percentile_sorted(sorted, 0.75);
+    scale = q75 - q25;
+    if (!std::isfinite(scale) || scale <= 1e-12f) {
+        scale = 1.0f;
+    }
 }
 
 }  // namespace
@@ -226,6 +256,8 @@ QueryCoordinator::~QueryCoordinator() {
     // Free up global merger buffers
     if (global_heap_vals_buffer_ != nullptr) quake_free(global_heap_vals_buffer_, global_heap_buffer_capacity_ * sizeof(float));
     if (global_heap_ids_buffer_ != nullptr) quake_free(global_heap_ids_buffer_, global_heap_buffer_capacity_ * sizeof(int64_t));
+    if (aps_heap_vals_buffer_ != nullptr) quake_free(aps_heap_vals_buffer_, aps_heap_buffer_capacity_ * sizeof(float));
+    if (aps_heap_ids_buffer_ != nullptr) quake_free(aps_heap_ids_buffer_, aps_heap_buffer_capacity_ * sizeof(int64_t));
 }
 
 void QueryCoordinator::allocate_core_resources(int core_idx,
@@ -283,14 +315,31 @@ void QueryCoordinator::merge_worker_fn(int mid) {
             for (size_t i = 0; i < rj.distances.size(); ++i) {
                 h->add_result(rj.distances[i], rj.indices[i]);
             }
+            if (aps_pivot_k_ < h->k) {
+                auto aps_h = std::static_pointer_cast<Handler>(
+                    MR.aps_handlers[rj.query_id]);
+                const size_t aps_n = std::min<size_t>(
+                    static_cast<size_t>(aps_pivot_k_), rj.distances.size());
+                for (size_t i = 0; i < aps_n; ++i) {
+                    aps_h->add_result(rj.distances[i], rj.indices[i]);
+                }
+                query_dist_pivots_[rj.query_id].store(
+                    aps_h->threshold, std::memory_order_relaxed);
+            } else {
+                query_dist_pivots_[rj.query_id].store(
+                    h->threshold, std::memory_order_relaxed);
+            }
             // update pivot
-            query_dist_pivots_[rj.query_id].store(h->threshold,
-                                                  std::memory_order_relaxed);
         }
 
         // once all ranks for this query are in, finalize & sort
         if (per_query_total_left_[rj.query_id].fetch_sub(1, std::memory_order_acq_rel) == 1) {
             h->end();
+            if (aps_pivot_k_ < h->k) {
+                auto aps_h = std::static_pointer_cast<Handler>(
+                    MR.aps_handlers[rj.query_id]);
+                aps_h->end();
+            }
 
             // pack into pairs for sorting
             int k = h->k;
@@ -820,6 +869,8 @@ void QueryCoordinator::init_global_buffers(int64_t nQ,
 
     // resize or reset
     size_t query_capacity = nQ * K;
+    aps_pivot_k_ = std::max(1, std::min(params ? params->k : K, K));
+    const bool use_separate_aps_heap = aps_pivot_k_ < K;
     if(global_heap_vals_buffer_ == nullptr || global_heap_ids_buffer_ == nullptr || global_heap_buffer_capacity_ < query_capacity) { 
         // Free any existing buffers
         if (global_heap_vals_buffer_ != nullptr) quake_free(global_heap_vals_buffer_, global_heap_buffer_capacity_ * sizeof(float));
@@ -839,19 +890,56 @@ void QueryCoordinator::init_global_buffers(int64_t nQ,
 
     std::fill_n(global_heap_vals_buffer_, query_capacity, max_val);
 
+    const size_t aps_query_capacity =
+        static_cast<size_t>(nQ) * static_cast<size_t>(aps_pivot_k_);
+    if (use_separate_aps_heap &&
+        (aps_heap_vals_buffer_ == nullptr ||
+         aps_heap_ids_buffer_ == nullptr ||
+         aps_heap_buffer_capacity_ < aps_query_capacity)) {
+        if (aps_heap_vals_buffer_ != nullptr) quake_free(
+            aps_heap_vals_buffer_, aps_heap_buffer_capacity_ * sizeof(float));
+        if (aps_heap_ids_buffer_ != nullptr) quake_free(
+            aps_heap_ids_buffer_, aps_heap_buffer_capacity_ * sizeof(int64_t));
+        aps_heap_vals_buffer_ =
+            static_cast<float*>(quake_alloc(aps_query_capacity * sizeof(float), 0));
+        aps_heap_ids_buffer_ =
+            static_cast<int64_t*>(quake_alloc(aps_query_capacity * sizeof(int64_t), 0));
+        aps_heap_buffer_capacity_ = aps_query_capacity;
+    }
+    if (use_separate_aps_heap) {
+        std::fill_n(aps_heap_ids_buffer_, aps_query_capacity, -1);
+        std::fill_n(aps_heap_vals_buffer_, aps_query_capacity, max_val);
+    }
+
     if (metric_ == faiss::METRIC_INNER_PRODUCT) {
         global_max_heaps_ = std::make_shared<
             faiss::HeapBlockResultHandler<
                 faiss::CMin<float,int64_t>>>(nQ, global_heap_vals_buffer_, global_heap_ids_buffer_, K);
+        if (use_separate_aps_heap) {
+            aps_max_heaps_ = std::make_shared<
+                faiss::HeapBlockResultHandler<
+                    faiss::CMin<float,int64_t>>>(
+                        nQ, aps_heap_vals_buffer_, aps_heap_ids_buffer_,
+                        aps_pivot_k_);
+        }
     } else {
         global_min_heaps_ = std::make_shared<
             faiss::HeapBlockResultHandler<
                 faiss::CMax<float,int64_t>>>(nQ, global_heap_vals_buffer_, global_heap_ids_buffer_, K);
+        if (use_separate_aps_heap) {
+            aps_min_heaps_ = std::make_shared<
+                faiss::HeapBlockResultHandler<
+                    faiss::CMax<float,int64_t>>>(
+                        nQ, aps_heap_vals_buffer_, aps_heap_ids_buffer_,
+                        aps_pivot_k_);
+        }
     }
 
     for (auto& mr : merge_res_) {
         mr.handlers.clear();
         mr.handlers.resize(nQ, nullptr);
+        mr.aps_handlers.clear();
+        mr.aps_handlers.resize(nQ, nullptr);
 
         /* allocate handler objects once per query --------------------------- */
         if (metric_ == faiss::METRIC_INNER_PRODUCT) {
@@ -861,6 +949,12 @@ void QueryCoordinator::init_global_buffers(int64_t nQ,
                 mr.handlers[q] = std::make_shared<H>(*global_max_heaps_);
                 std::shared_ptr<H> ip_ptr = std::static_pointer_cast<H>(mr.handlers[q]);
                 ip_ptr->begin(q);
+                if (use_separate_aps_heap) {
+                    mr.aps_handlers[q] = std::make_shared<H>(*aps_max_heaps_);
+                    std::shared_ptr<H> aps_ptr =
+                        std::static_pointer_cast<H>(mr.aps_handlers[q]);
+                    aps_ptr->begin(q);
+                }
             }
         } else {
             using H = faiss::HeapBlockResultHandler<
@@ -869,6 +963,12 @@ void QueryCoordinator::init_global_buffers(int64_t nQ,
                 mr.handlers[q] = std::make_shared<H>(*global_min_heaps_);
                 std::shared_ptr<H> lp_ptr = std::static_pointer_cast<H>(mr.handlers[q]);
                 lp_ptr->begin(q);
+                if (use_separate_aps_heap) {
+                    mr.aps_handlers[q] = std::make_shared<H>(*aps_min_heaps_);
+                    std::shared_ptr<H> aps_ptr =
+                        std::static_pointer_cast<H>(mr.aps_handlers[q]);
+                    aps_ptr->begin(q);
+                }
             }
         }
     }
@@ -1264,6 +1364,10 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
     }
 
     size_t partitions_per_query = partition_ids.size(1);
+    if (search_params->collect_scanned_partition_ids) {
+        timing->scanned_partition_ids.clear();
+        timing->scanned_partition_ids.reserve(nQ);
+    }
     for (int64_t q = 0; q < nQ; ++q) {
         std::vector<int64_t> scanned_ids;
         scanned_ids.reserve(partitions_per_query);
@@ -1278,7 +1382,218 @@ void QueryCoordinator::drain_and_apply_aps(Tensor                      queries,
         if (search_params->track_hits && maintenance_policy_) {
             maintenance_policy_->record_query_hits(scanned_ids);
         }
+        if (search_params->collect_scanned_partition_ids) {
+            timing->scanned_partition_ids.push_back(std::move(scanned_ids));
+        }
     }
+}
+
+void QueryCoordinator::apply_stable_rerank(const Tensor& queries,
+                                            const Tensor& candidate_ids,
+                                            const Tensor& candidate_dists,
+                                            shared_ptr<SearchParams> params,
+                                            int k,
+                                            Tensor& out_ids,
+                                            Tensor& out_dists,
+                                            vector<string>& variant_names,
+                                            vector<Tensor>& variant_ids,
+                                            vector<Tensor>& variant_dists) {
+    // Caller has verified the active representation supports stable rerank.
+    const auto& rep = partition_manager_->representation_;
+    const int64_t nQ = candidate_ids.size(0);
+    const int64_t M = candidate_ids.size(1);
+
+    auto ca = candidate_ids.accessor<int64_t, 2>();
+    auto cd = candidate_dists.accessor<float, 2>();
+    auto oi = out_ids.accessor<int64_t, 2>();
+    auto od = out_dists.accessor<float, 2>();
+    // queries is forced contiguous on the caller side (torch::empty in
+    // worker_scan returns row-major contig storage); read raw float* once
+    // and pointer-arithmetic into it inside the per-query loop.
+    const float* queries_data = queries.data_ptr<float>();
+    const int64_t D = queries.size(1);
+    const float residual_weight =
+        params == nullptr ? 0.0f : params->stable_rerank_residual_weight;
+
+    const float inf = std::numeric_limits<float>::infinity();
+    const size_t raw_count = params ? params->rerank_sweep_raw_weights.size() : 0;
+    const size_t z_count = params ? params->rerank_sweep_z_weights.size() : 0;
+    const size_t rank_count = params ? params->rerank_sweep_rank_weights.size() : 0;
+    const size_t variant_count = raw_count + z_count + rank_count;
+    variant_names.clear();
+    variant_ids.clear();
+    variant_dists.clear();
+    variant_names.reserve(variant_count);
+    variant_ids.reserve(variant_count);
+    variant_dists.reserve(variant_count);
+    if (params != nullptr) {
+        for (float w : params->rerank_sweep_raw_weights) {
+            variant_names.push_back("raw_w=" + std::to_string(w));
+        }
+        for (float w : params->rerank_sweep_z_weights) {
+            variant_names.push_back("z_w=" + std::to_string(w));
+        }
+        for (float w : params->rerank_sweep_rank_weights) {
+            variant_names.push_back("rank_w=" + std::to_string(w));
+        }
+    }
+    for (size_t v = 0; v < variant_count; ++v) {
+        variant_ids.push_back(torch::full({nQ, k}, -1, torch::kLong));
+        variant_dists.push_back(torch::full(
+            {nQ, k}, std::numeric_limits<float>::infinity(), torch::kFloat));
+    }
+
+    parallel_for<int64_t>(0, nQ, [&](int64_t q) {
+        // Heap entries with id < 0 are unfilled slots (residual scan
+        // returned fewer than M candidates for this query). Drop them
+        // before the rerank pass.
+        std::vector<int64_t> valid_ids;
+        std::vector<float> valid_residual_l2;
+        valid_ids.reserve(static_cast<size_t>(M));
+        valid_residual_l2.reserve(static_cast<size_t>(M));
+        for (int64_t i = 0; i < M; ++i) {
+            if (ca[q][i] >= 0) {
+                valid_ids.push_back(ca[q][i]);
+                valid_residual_l2.push_back(cd[q][i]);
+            }
+        }
+
+        if (valid_ids.empty()) {
+            for (int i = 0; i < k; ++i) {
+                oi[q][i] = -1;
+                od[q][i] = inf;
+            }
+            return;
+        }
+
+        vector<float*> code_ptrs =
+            partition_manager_->partition_store_->get_vectors_by_id(valid_ids);
+
+        const float* query = queries_data + q * D;
+
+        std::vector<int64_t> usable_ids;
+        std::vector<float> stable_d2s;
+        std::vector<float> residual_d2s;
+        usable_ids.reserve(valid_ids.size());
+        stable_d2s.reserve(valid_ids.size());
+        residual_d2s.reserve(valid_ids.size());
+        std::vector<std::pair<float, int64_t>> ranked;
+        ranked.reserve(valid_ids.size());
+        for (size_t i = 0; i < valid_ids.size(); ++i) {
+            if (code_ptrs[i] == nullptr) {
+                continue;  // Defensive: id removed between scan and rerank.
+            }
+            const auto* code = reinterpret_cast<const uint8_t*>(code_ptrs[i]);
+            const float stable_d2 = rep->stable_rerank_distance(query, code);
+            const float residual_l2 = valid_residual_l2[i];
+            const float residual_d2 = std::isfinite(residual_l2)
+                ? residual_l2 * residual_l2
+                : std::numeric_limits<float>::infinity();
+            const float score = stable_d2 + residual_weight * residual_d2;
+            usable_ids.push_back(valid_ids[i]);
+            stable_d2s.push_back(stable_d2);
+            residual_d2s.push_back(residual_d2);
+            ranked.emplace_back(score, valid_ids[i]);
+        }
+
+        const int top_k = std::min<int>(k, static_cast<int>(ranked.size()));
+        std::partial_sort(ranked.begin(), ranked.begin() + top_k, ranked.end(),
+                          [](const std::pair<float, int64_t>& a,
+                             const std::pair<float, int64_t>& b) {
+                              return a.first < b.first;
+                          });
+
+        // Match the residual-scan output convention: distances are L2
+        // (not L2²). For mixed rerank this is sqrt(score), not a pure
+        // physical distance.
+        for (int i = 0; i < top_k; ++i) {
+            const float d2 = ranked[static_cast<size_t>(i)].first;
+            od[q][i] = d2 <= 0.0f ? 0.0f : std::sqrt(d2);
+            oi[q][i] = ranked[static_cast<size_t>(i)].second;
+        }
+        for (int i = top_k; i < k; ++i) {
+            oi[q][i] = -1;
+            od[q][i] = inf;
+        }
+
+        if (variant_count == 0 || usable_ids.empty()) {
+            return;
+        }
+
+        auto emit_variant = [&](size_t variant_idx,
+                                const std::vector<std::pair<float, int64_t>>& scored) {
+            auto vi = variant_ids[variant_idx].accessor<int64_t, 2>();
+            auto vd = variant_dists[variant_idx].accessor<float, 2>();
+            std::vector<std::pair<float, int64_t>> sorted = scored;
+            const int n_top = std::min<int>(k, static_cast<int>(sorted.size()));
+            std::partial_sort(sorted.begin(), sorted.begin() + n_top, sorted.end(),
+                              [](const std::pair<float, int64_t>& a,
+                                 const std::pair<float, int64_t>& b) {
+                                  return a.first < b.first;
+                              });
+            for (int i = 0; i < n_top; ++i) {
+                const float score = sorted[static_cast<size_t>(i)].first;
+                vd[q][i] = score <= 0.0f ? 0.0f : std::sqrt(score);
+                vi[q][i] = sorted[static_cast<size_t>(i)].second;
+            }
+            for (int i = n_top; i < k; ++i) {
+                vd[q][i] = inf;
+                vi[q][i] = -1;
+            }
+        };
+
+        size_t variant_idx = 0;
+        if (params != nullptr) {
+            for (float w : params->rerank_sweep_raw_weights) {
+                std::vector<std::pair<float, int64_t>> scored;
+                scored.reserve(usable_ids.size());
+                for (size_t i = 0; i < usable_ids.size(); ++i) {
+                    scored.emplace_back(stable_d2s[i] + w * residual_d2s[i],
+                                        usable_ids[i]);
+                }
+                emit_variant(variant_idx++, scored);
+            }
+
+            float stable_center = 0.0f, stable_scale = 1.0f;
+            float residual_center = 0.0f, residual_scale = 1.0f;
+            robust_center_scale(stable_d2s, stable_center, stable_scale);
+            robust_center_scale(residual_d2s, residual_center, residual_scale);
+            for (float w : params->rerank_sweep_z_weights) {
+                std::vector<std::pair<float, int64_t>> scored;
+                scored.reserve(usable_ids.size());
+                for (size_t i = 0; i < usable_ids.size(); ++i) {
+                    const float zs = (stable_d2s[i] - stable_center) / stable_scale;
+                    const float zr = (residual_d2s[i] - residual_center) / residual_scale;
+                    scored.emplace_back(zs + w * zr, usable_ids[i]);
+                }
+                emit_variant(variant_idx++, scored);
+            }
+
+            std::vector<size_t> stable_order(usable_ids.size());
+            std::vector<size_t> residual_order(usable_ids.size());
+            std::iota(stable_order.begin(), stable_order.end(), 0);
+            std::iota(residual_order.begin(), residual_order.end(), 0);
+            std::sort(stable_order.begin(), stable_order.end(),
+                      [&](size_t a, size_t b) { return stable_d2s[a] < stable_d2s[b]; });
+            std::sort(residual_order.begin(), residual_order.end(),
+                      [&](size_t a, size_t b) { return residual_d2s[a] < residual_d2s[b]; });
+            std::vector<float> stable_rank(usable_ids.size());
+            std::vector<float> residual_rank(usable_ids.size());
+            for (size_t r = 0; r < usable_ids.size(); ++r) {
+                stable_rank[stable_order[r]] = static_cast<float>(r);
+                residual_rank[residual_order[r]] = static_cast<float>(r);
+            }
+            for (float w : params->rerank_sweep_rank_weights) {
+                std::vector<std::pair<float, int64_t>> scored;
+                scored.reserve(usable_ids.size());
+                for (size_t i = 0; i < usable_ids.size(); ++i) {
+                    scored.emplace_back(stable_rank[i] + w * residual_rank[i],
+                                        usable_ids[i]);
+                }
+                emit_variant(variant_idx++, scored);
+            }
+        }
+    }, num_workers_);
 }
 
 std::shared_ptr<SearchResult>
@@ -1327,6 +1642,26 @@ std::shared_ptr<SearchResult> QueryCoordinator::worker_scan(
     int     K  = params->k;
     bool    use_aps = (params->recall_target>0 && parent_);
 
+    // Anchor rerank (spec/anchor_rerank.md): when stable_rerank_k > k AND the
+    // active leaf representation exposes a stable view, the residual scan
+    // collects a top-M heap (M = stable_rerank_k) and a post-aggregation step
+    // reranks those candidates by stable distance to produce the final top-k.
+    // When either condition is false we fall back to residual-only top-K.
+    //
+    // Stable rerank only widens the *global* residual candidate heap. Worker
+    // scans still use the user-facing K, so per-partition scan cost, APS pivots,
+    // and APS timing stay matched to the residual-only path. The larger global
+    // heap then selects top-M candidates from the union of per-partition top-K
+    // results before stable rerank chooses the final top-K.
+    int effective_K = K;
+    bool stable_rerank_enabled = false;
+    if (params->stable_rerank_k > K &&
+        partition_manager_ && partition_manager_->representation_ &&
+        partition_manager_->representation_->supports_stable_rerank()) {
+        effective_K = params->stable_rerank_k;
+        stable_rerank_enabled = true;
+    }
+
     int64_t nJobsExpected = 0;
 
     auto timing = std::make_shared<SearchTimingInfo>();
@@ -1370,8 +1705,9 @@ std::shared_ptr<SearchResult> QueryCoordinator::worker_scan(
 
     auto s1 = high_resolution_clock::now();
 
-    // 1) init global buffers & jobs_left
-    init_global_buffers(nQ, K, partition_ids, params);
+    // 1) init global buffers & jobs_left at effective_K — the residual heap
+    //    holds M candidates when rerank is enabled, K otherwise.
+    init_global_buffers(nQ, effective_K, partition_ids, params);
 
     auto s2 = high_resolution_clock::now();
 
@@ -1380,7 +1716,8 @@ std::shared_ptr<SearchResult> QueryCoordinator::worker_scan(
 
     auto s3 = high_resolution_clock::now();
 
-    // 3) enqueue jobs
+    // 3) enqueue jobs with the original K. Rerank widens only the global merge
+    // heap, not per-partition TopK buffers.
     enqueue_scan_jobs(x, partition_ids, params);
 
     auto s4 = high_resolution_clock::now();
@@ -1393,7 +1730,32 @@ std::shared_ptr<SearchResult> QueryCoordinator::worker_scan(
 
     auto s5 = high_resolution_clock::now();
 
-    auto res = aggregate_scan_results(nQ, K, timing, out_ids, out_dists);
+    std::shared_ptr<SearchResult> res;
+    if (stable_rerank_enabled) {
+        // Pull the top-M candidates out of the residual heap, then rerank
+        // by stable distance into the user-facing top-K. The temporary
+        // tensors are sized at effective_K rows so aggregate_scan_results'
+        // existing K-loop fills the full residual heap.
+        Tensor cand_ids = torch::empty({nQ, effective_K}, torch::kLong);
+        Tensor cand_dists = torch::empty({nQ, effective_K}, torch::kFloat);
+        auto cand_res = aggregate_scan_results(nQ, effective_K, timing,
+                                               cand_ids, cand_dists);
+        vector<string> variant_names;
+        vector<Tensor> variant_ids;
+        vector<Tensor> variant_dists;
+        apply_stable_rerank(x, cand_ids, cand_dists, params, K,
+                            out_ids, out_dists, variant_names, variant_ids,
+                            variant_dists);
+        res = std::make_shared<SearchResult>();
+        res->ids = out_ids;
+        res->distances = out_dists;
+        res->timing_info = cand_res->timing_info;
+        res->rerank_variant_names = std::move(variant_names);
+        res->rerank_variant_ids = std::move(variant_ids);
+        res->rerank_variant_distances = std::move(variant_dists);
+    } else {
+        res = aggregate_scan_results(nQ, K, timing, out_ids, out_dists);
+    }
 
     auto s6 = high_resolution_clock::now();
 
@@ -1662,6 +2024,7 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
     // Allocate per-query result vectors.
     vector<vector<float>> all_topk_dists(num_queries);
     vector<vector<int64_t>> all_topk_ids(num_queries);
+    vector<vector<int64_t>> all_scanned_ids(num_queries);
     vector<int> scanned_counts(num_queries, 0);
 
     // Use our custom parallel_for to process queries in parallel.
@@ -1775,10 +2138,11 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
         }
 
         scanned_counts[q] = static_cast<int>(scanned_ids.size());
+        all_scanned_ids[q] = std::move(scanned_ids);
 
         if (search_params->track_hits && maintenance_policy_) {
-            if (debug_) std::cout << "[QueryCoordinator::serial_scan] record_query_hits being called with " << scanned_ids.size() << " ids" << std::endl;
-            maintenance_policy_->record_query_hits(std::vector<int64_t>(scanned_ids.begin(), scanned_ids.end()));
+            if (debug_) std::cout << "[QueryCoordinator::serial_scan] record_query_hits being called with " << all_scanned_ids[q].size() << " ids" << std::endl;
+            maintenance_policy_->record_query_hits(all_scanned_ids[q]);
         }
 
         // Retrieve the top-k results for query q.
@@ -1797,8 +2161,15 @@ shared_ptr<SearchResult> QueryCoordinator::serial_scan(Tensor x, Tensor partitio
     // Aggregate per-query results into output tensors.
     auto ret_ids_accessor = ret_ids.accessor<int64_t, 2>();
     auto ret_dists_accessor = ret_dists.accessor<float, 2>();
+    if (search_params->collect_scanned_partition_ids) {
+        timing_info->scanned_partition_ids.reserve(num_queries);
+    }
     for (int64_t q = 0; q < num_queries; q++) {
         timing_info->partitions_scanned += scanned_counts[q];
+        if (search_params->collect_scanned_partition_ids) {
+            timing_info->scanned_partition_ids.push_back(
+                std::move(all_scanned_ids[q]));
+        }
         int n_results = std::min((int)all_topk_dists[q].size(), k);
         for (int i = 0; i < n_results; i++) {
             ret_dists_accessor[q][i] = all_topk_dists[q][i];
@@ -2055,6 +2426,12 @@ shared_ptr<SearchResult> QueryCoordinator::batched_serial_scan(
     auto end = high_resolution_clock::now();
     timing_info->total_time_ns = duration_cast<nanoseconds>(end - start).count();
     timing_info->partitions_scanned = num_queries;
+    if (search_params->collect_scanned_partition_ids) {
+        timing_info->scanned_partition_ids.resize(num_queries);
+        for (int q = 0; q < num_queries; ++q) {
+            timing_info->scanned_partition_ids[q].push_back(pid);
+        }
+    }
 
     timing_info->worker_process_preamble_time_ns = job_setup_time;
     timing_info->worker_scan_time_ns = job_scan_time;

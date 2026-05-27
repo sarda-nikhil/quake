@@ -133,6 +133,7 @@ public:
     struct MergeResources {
      moodycamel::BlockingConcurrentQueue<ResultJob> queue;
      std::vector<shared_ptr<void>> handlers;        // points to HandlerIP or HandlerL2
+     std::vector<shared_ptr<void>> aps_handlers;    // optional K-deep handlers for APS pivots
     };
 
     vector<CoreResources> core_resources_;             ///< Per‑core resources for worker threads.
@@ -150,9 +151,14 @@ public:
     float* global_heap_vals_buffer_{nullptr}; 
     int64_t* global_heap_ids_buffer_{nullptr};
     size_t global_heap_buffer_capacity_{0};
+    float* aps_heap_vals_buffer_{nullptr};
+    int64_t* aps_heap_ids_buffer_{nullptr};
+    size_t aps_heap_buffer_capacity_{0};
 
     shared_ptr<faiss::HeapBlockResultHandler<faiss::CMax<float, int64_t>>> global_min_heaps_; ///< Global aggregator buffers.
     shared_ptr<faiss::HeapBlockResultHandler<faiss::CMin<float, int64_t>>> global_max_heaps_; ///< Global aggregator buffers.
+    shared_ptr<faiss::HeapBlockResultHandler<faiss::CMax<float, int64_t>>> aps_min_heaps_;
+    shared_ptr<faiss::HeapBlockResultHandler<faiss::CMin<float, int64_t>>> aps_max_heaps_;
 
     std::mutex global_mutex_;                          ///< Mutex for global synchronization.
     std::condition_variable global_cv_;                ///< Condition variable for thread coordination.
@@ -163,6 +169,7 @@ public:
     int   next_job_id_ = 0; ///< ID for the next job to be processed.
     vector<std::atomic<float>> query_dist_pivots_; ///< Pivots for each query to speed up sorting
     vector<std::atomic<bool>> query_done_flags_; ///< Flags to indicate if a query is done from APS
+    int aps_pivot_k_ = 1; ///< User-facing k for APS when heap depth is larger for rerank.
     vector<std::atomic<int>> max_rank_; ///< Maximum rank for each query to ensure APS doesn't overshoot
     vector<vector<std::atomic<bool>>> job_flags_; ///< Flags to track job completion
     std::atomic<int64_t> job_pull_time_ns = 0; ///< Time spent pulling jobs from the queue.
@@ -332,6 +339,32 @@ private:
                            shared_ptr<SearchTimingInfo> timing,
                            Tensor out_ids,
                             Tensor out_dists);
+
+    /**
+     * @brief Anchor rerank (spec/anchor_rerank.md §"Search integration").
+     *
+     * The residual scan produces top-M candidate (id, dist) pairs in
+     * |candidate_ids| / |candidate_dists|. For each query we look up each
+     * candidate's code through PartitionManager, ask the active leaf
+     * representation to compute its stable rerank distance (the anchor-view
+     * L2² for AnchorCodec), optionally mix residual L2² back in, then select
+     * the top-|k| into
+     * |out_ids| / |out_dists|. The final distances are written as L2 (the
+     * sqrt of the stable L2²) to match the existing residual-scan output
+     * contract.
+     *
+     * Pre: |partition_manager_->representation_->supports_stable_rerank()|.
+     */
+    void apply_stable_rerank(const Tensor& queries,
+                             const Tensor& candidate_ids,
+                             const Tensor& candidate_dists,
+                             shared_ptr<SearchParams> params,
+                             int k,
+                             Tensor& out_ids,
+                             Tensor& out_dists,
+                             vector<string>& variant_names,
+                             vector<Tensor>& variant_ids,
+                             vector<Tensor>& variant_dists);
     };
 
 #endif //QUERY_COORDINATOR_H

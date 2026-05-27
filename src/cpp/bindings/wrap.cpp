@@ -118,6 +118,94 @@ PYBIND11_MODULE(_bindings, m) {
              "Retrieve vectors from the index by ID.\n\n"
              "Args:\n"
              "    ids (Tensor): Tensor of IDs to retrieve.")
+        .def("debug_partition_centroids", [](QuakeIndex &q, Tensor partition_ids) {
+             if (!q.partition_manager_) {
+                 throw std::runtime_error("QuakeIndex has no partition manager.");
+             }
+             if (!partition_ids.defined() || partition_ids.numel() == 0) {
+                 partition_ids = q.partition_manager_->get_partition_ids();
+             }
+             partition_ids = partition_ids.contiguous();
+             if (q.parent_ != nullptr) {
+                 return q.parent_->get(partition_ids);
+             }
+             return q.partition_manager_->select_partitions(partition_ids, true)->centroids;
+         }, arg("partition_ids") = Tensor(),
+             "Return current centroid rows for the requested leaf partition IDs.")
+        .def("debug_partition_member_ids", [](QuakeIndex &q, Tensor partition_ids) {
+             if (!q.partition_manager_ || !q.partition_manager_->partition_store_) {
+                 throw std::runtime_error("QuakeIndex has no partition store.");
+             }
+             if (!partition_ids.defined() || partition_ids.numel() == 0) {
+                 partition_ids = q.partition_manager_->get_partition_ids();
+             }
+             partition_ids = partition_ids.contiguous();
+             auto pid_acc = partition_ids.accessor<int64_t, 1>();
+             std::vector<Tensor> members;
+             members.reserve(static_cast<size_t>(partition_ids.size(0)));
+             for (int64_t i = 0; i < partition_ids.size(0); ++i) {
+                 const int64_t pid = pid_acc[i];
+                 const int64_t size = q.partition_manager_->partition_store_->list_size(pid);
+                 const idx_t* ids = q.partition_manager_->partition_store_->get_ids(pid);
+                 members.push_back(
+                     torch::from_blob((void*)ids, {size}, torch::kInt64).clone());
+             }
+             return members;
+         }, arg("partition_ids") = Tensor(),
+             "Return member vector IDs for each requested leaf partition.")
+        .def("debug_id_to_partition", [](QuakeIndex &q, Tensor ids) {
+             if (!q.partition_manager_ || !q.partition_manager_->partition_store_) {
+                 throw std::runtime_error("QuakeIndex has no partition store.");
+             }
+             ids = ids.contiguous();
+             auto out = torch::full({ids.size(0)}, -1, torch::kInt64);
+             auto in_acc = ids.accessor<int64_t, 1>();
+             auto out_acc = out.accessor<int64_t, 1>();
+             auto store = q.partition_manager_->partition_store_;
+             if (store->id_to_location_.empty()) {
+                 store->build_map();
+             }
+             for (int64_t i = 0; i < ids.size(0); ++i) {
+                 auto it = store->id_to_location_.find(in_acc[i]);
+                 if (it != store->id_to_location_.end() && it->second.first != nullptr) {
+                     out_acc[i] = it->second.first->partition_id_;
+                 }
+             }
+             return out;
+         }, arg("ids"),
+             "Return the current leaf partition ID for each vector ID, or -1 if absent.")
+        .def("debug_partition_snapshot", [](QuakeIndex &q, Tensor partition_ids) {
+             if (!q.partition_manager_) {
+                 throw std::runtime_error("QuakeIndex has no partition manager.");
+             }
+             if (!partition_ids.defined() || partition_ids.numel() == 0) {
+                 partition_ids = q.partition_manager_->get_partition_ids();
+             }
+             partition_ids = partition_ids.contiguous();
+             py::dict snapshot;
+             snapshot["partition_ids"] = partition_ids;
+             snapshot["partition_sizes"] =
+                 q.partition_manager_->get_partition_sizes(partition_ids);
+             if (q.parent_ != nullptr) {
+                 snapshot["centroids"] = q.parent_->get(partition_ids);
+             } else {
+                 snapshot["centroids"] =
+                     q.partition_manager_->select_partitions(partition_ids, true)->centroids;
+             }
+             std::vector<Tensor> members;
+             members.reserve(static_cast<size_t>(partition_ids.size(0)));
+             auto pid_acc = partition_ids.accessor<int64_t, 1>();
+             for (int64_t i = 0; i < partition_ids.size(0); ++i) {
+                 const int64_t pid = pid_acc[i];
+                 const int64_t size = q.partition_manager_->partition_store_->list_size(pid);
+                 const idx_t* ids = q.partition_manager_->partition_store_->get_ids(pid);
+                 members.push_back(
+                     torch::from_blob((void*)ids, {size}, torch::kInt64).clone());
+             }
+             snapshot["member_ids"] = members;
+             return snapshot;
+         }, arg("partition_ids") = Tensor(),
+             "Return partition IDs, sizes, centroids, and member IDs for diagnostics.")
         .def("get_ids", &QuakeIndex::get_ids, "Return all vector IDs stored in the index.")
         .def("add", &QuakeIndex::add,
              "Add new vectors to the index.\n\n"
@@ -237,12 +325,38 @@ PYBIND11_MODULE(_bindings, m) {
                           "disables (FP32-equivalent). default = ") +
               std::to_string(DEFAULT_APS_CODEC_INFLATION_ALPHA))
                  .c_str())
+        .def_readwrite("stable_rerank_k",
+             &SearchParams::stable_rerank_k,
+             (std::string("Anchor rerank candidate budget M. When > k AND "
+                          "the leaf representation supports stable rerank, "
+                          "the residual heap is enlarged to top-M and the "
+                          "final top-k is selected by stable (anchor-view) "
+                          "distance. 0 disables. default = ") +
+              std::to_string(DEFAULT_STABLE_RERANK_K))
+                 .c_str())
+        .def_readwrite("stable_rerank_residual_weight",
+             &SearchParams::stable_rerank_residual_weight,
+             "Weight for mixing residual candidate L2^2 into stable rerank "
+             "score. score = stable_l2sq + weight * residual_l2sq. Default 0 "
+             "preserves anchor-only rerank.")
+        .def_readwrite("rerank_sweep_raw_weights",
+             &SearchParams::rerank_sweep_raw_weights,
+             "Raw distance-mix rerank sweep weights.")
+        .def_readwrite("rerank_sweep_z_weights",
+             &SearchParams::rerank_sweep_z_weights,
+             "Robust z-score distance-mix rerank sweep weights.")
+        .def_readwrite("rerank_sweep_rank_weights",
+             &SearchParams::rerank_sweep_rank_weights,
+             "Rank-fusion rerank sweep weights.")
         .def_readwrite("batch_size", &SearchParams::batch_size,
              (std::string("Batch size for batched scan. default = ") + std::to_string(MAX_SUBBATCH)).c_str())
         .def_readwrite("k_factor", &SearchParams::k_factor,
              "Factor to adjust the number of neighbors to return.")
         .def_readwrite("track_hits", &SearchParams::track_hits,
              "Flag to track hits for maintenance policy.")
+        .def_readwrite("collect_scanned_partition_ids",
+             &SearchParams::collect_scanned_partition_ids,
+             "Collect exact scanned partition IDs per query for diagnostics.")
         .def_readwrite("use_auncel", &SearchParams::use_auncel,
                 "Flag to use Auncel recall estimation for search.")
         .def_readwrite("auncel_a", &SearchParams::auncel_a,
@@ -348,6 +462,27 @@ PYBIND11_MODULE(_bindings, m) {
              &MaintenancePolicyParams::min_split_assignment_probability,
              "Minimum mean probability that true FP32 assignments agree with "
              "the reconstructed split assignments. default = 0.5.")
+        .def_readwrite("enable_anchor_split_telemetry",
+             &MaintenancePolicyParams::enable_anchor_split_telemetry,
+             "Anchor-view split telemetry (spec/anchor_rerank.md). "
+             "When true, cost-model split candidates are dry-run in the "
+             "codec's stable (anchor) reconstruction space and the resulting "
+             "distortion/drop and assignment-stability signals are exported "
+             "on MaintenanceTimingInfo. This never vetoes or forces a split. "
+             "default = false.")
+        .def_readwrite("enable_anchor_split_validation",
+             &MaintenancePolicyParams::enable_anchor_split_validation,
+             "Deprecated compatibility alias for anchor split telemetry. "
+             "This no longer vetoes splits; it only enables the same "
+             "MaintenanceTimingInfo telemetry as enable_anchor_split_telemetry.")
+        .def_readwrite("min_anchor_distortion_drop_frac",
+             &MaintenancePolicyParams::min_anchor_distortion_drop_frac,
+             "Deprecated telemetry annotation; not used to accept or reject "
+             "splits. default = 0.05.")
+        .def_readwrite("max_anchor_assignment_disagreement",
+             &MaintenancePolicyParams::max_anchor_assignment_disagreement,
+             "Deprecated telemetry annotation; not used to accept or reject "
+             "splits. default = 0.20.")
         .def("__repr__", [](const MaintenancePolicyParams &m) {
             std::ostringstream oss;
             oss << "{";
@@ -380,6 +515,30 @@ PYBIND11_MODULE(_bindings, m) {
              "Number of partition split operations performed.")
          .def_readonly("n_deletes", &MaintenanceTimingInfo::n_deletes,
              "Number of partition delete operations performed.")
+         .def_readonly("n_split_candidates",
+             &MaintenanceTimingInfo::n_split_candidates,
+             "Number of cost-model split candidates before per-round caps.")
+         .def_readonly("n_anchor_split_telemetry_candidates",
+             &MaintenanceTimingInfo::n_anchor_split_telemetry_candidates,
+             "Number of split candidates with stable-view telemetry.")
+         .def_readonly("anchor_distortion_drop_frac_sum",
+             &MaintenanceTimingInfo::anchor_distortion_drop_frac_sum,
+             "Sum of anchor-space split distortion-drop fractions.")
+         .def_readonly("anchor_distortion_drop_frac_min",
+             &MaintenanceTimingInfo::anchor_distortion_drop_frac_min,
+             "Minimum anchor-space split distortion-drop fraction.")
+         .def_readonly("anchor_distortion_drop_frac_max",
+             &MaintenanceTimingInfo::anchor_distortion_drop_frac_max,
+             "Maximum anchor-space split distortion-drop fraction.")
+         .def_readonly("anchor_assignment_disagreement_bound_sum",
+             &MaintenanceTimingInfo::anchor_assignment_disagreement_bound_sum,
+             "Sum of anchor assignment-disagreement bounds.")
+         .def_readonly("anchor_assignment_disagreement_bound_max",
+             &MaintenanceTimingInfo::anchor_assignment_disagreement_bound_max,
+             "Maximum anchor assignment-disagreement bound.")
+         .def_readonly("anchor_mean_error_sum",
+             &MaintenanceTimingInfo::anchor_mean_error_sum,
+             "Sum of mean stable-view reconstruction errors.")
          .def("__repr__", [](const MaintenanceTimingInfo &t) {
              std::ostringstream oss;
              oss << "{";
@@ -388,7 +547,14 @@ PYBIND11_MODULE(_bindings, m) {
              oss << "\"delete_time_us\": " << t.delete_time_us << ", ";
              oss << "\"refinement_time_us\": " << t.refinement_time_us << ", ";
              oss << "\"n_splits\": " << t.n_splits << ", ";
-             oss << "\"n_deletes\": " << t.n_deletes;
+             oss << "\"n_deletes\": " << t.n_deletes << ", ";
+             oss << "\"n_split_candidates\": " << t.n_split_candidates << ", ";
+             oss << "\"n_anchor_split_telemetry_candidates\": "
+                 << t.n_anchor_split_telemetry_candidates << ", ";
+             oss << "\"anchor_distortion_drop_frac_sum\": "
+                 << t.anchor_distortion_drop_frac_sum << ", ";
+             oss << "\"anchor_assignment_disagreement_bound_sum\": "
+                 << t.anchor_assignment_disagreement_bound_sum;
              oss << "}";
              return oss.str();
          });
@@ -444,6 +610,8 @@ PYBIND11_MODULE(_bindings, m) {
              "Number of clusters searched.")
          .def_readwrite("partitions_scanned", &SearchTimingInfo::partitions_scanned,
              "Number of partitions scanned.")
+         .def_readwrite("scanned_partition_ids", &SearchTimingInfo::scanned_partition_ids,
+             "Scanned partition IDs for each query.")
          .def_readwrite("search_params", &SearchTimingInfo::search_params,
              "Parameters used for the search operation.")
          .def_readwrite("parent_info", &SearchTimingInfo::parent_info,
@@ -526,6 +694,13 @@ PYBIND11_MODULE(_bindings, m) {
              "Indices of the nearest neighbors.")
          .def_readwrite("timing_info", &SearchResult::timing_info,
              "Timing information for the search operation.")
+         .def_readwrite("rerank_variant_names", &SearchResult::rerank_variant_names,
+             "Names for optional rerank sweep variants.")
+         .def_readwrite("rerank_variant_ids", &SearchResult::rerank_variant_ids,
+             "Result IDs for optional rerank sweep variants.")
+         .def_readwrite("rerank_variant_distances",
+             &SearchResult::rerank_variant_distances,
+             "Distances for optional rerank sweep variants.")
          .def("__repr__", [](const SearchResult &r) {
              std::ostringstream oss;
              oss << "{";
