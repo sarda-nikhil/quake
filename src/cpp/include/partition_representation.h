@@ -187,6 +187,49 @@ public:
     virtual float decoded_distance_stddev() const;
 
     /**
+     * @brief Whether this representation exposes a stable rerank view.
+     *
+     * The "stable" view is a per-vector reconstruction that survives all
+     * topology mutations (split, refine, merge) bit-exactly. AnchorCodec's
+     * anchor prefix is the canonical example; FP32 is trivially stable.
+     * CascadeCodec returns false because every ReEncode rewrites the entire
+     * payload. Anchor rerank (spec/anchor_rerank.md) is a no-op when this
+     * returns false; the search path then collapses to residual scan only.
+     */
+    virtual bool supports_stable_rerank() const;
+
+    /**
+     * @brief Squared L2 distance between |query| and the stable
+     * reconstruction of |code|. No centroid input: the stable view is
+     * centroid-independent. Caller must check supports_stable_rerank().
+     *
+     * Used by QueryCoordinator::apply_stable_rerank to score each of the
+     * top-M residual candidates after residual scan completes. Batched and
+     * decode-only stable-view APIs (StableRerankDistanceBatch, DecodeStable,
+     * DecodeStableBatch) are exposed at the underlying hssi::Codec layer
+     * and used directly by HSSI-internal callers (tests, benchmarks,
+     * future maintenance hooks). They are intentionally not duplicated on
+     * PartitionRepresentation until a production caller within Quake
+     * actually invokes them.
+     */
+    virtual float stable_rerank_distance(const float* query,
+                                         const uint8_t* code) const;
+
+    /**
+     * @brief Materialize the codec's stable reconstruction of |code| into
+     * |vector_out|. Centroid-independent by construction.
+     *
+     * Used by the anchor-view maintenance gate (PartitionManager::
+     * estimate_anchor_split_utility) to evaluate split geometry on the
+     * immutable view of each blob, rather than the residual-+-centroid
+     * reconstruction that reconstruct() returns and that mutates on every
+     * rewrite. Caller must check supports_stable_rerank() first; the base
+     * implementation throws.
+     */
+    virtual void decode_stable(const uint8_t* code,
+                               float* vector_out) const;
+
+    /**
      * @brief Re-encode a batch of payloads under new partition centroids.
      *
      * `assignments[i]` is the destination partition id for code `i`. The
@@ -278,6 +321,12 @@ public:
         const uint8_t* codes,
         int n) const override;
 
+    bool supports_stable_rerank() const override;
+    float stable_rerank_distance(const float* query,
+                                 const uint8_t* code) const override;
+    void decode_stable(const uint8_t* code,
+                       float* vector_out) const override;
+
     void batch_reencode(const uint8_t* codes,
                         const uint32_t* assignments,
                         const float* centroids,
@@ -367,6 +416,12 @@ public:
         int n) const override;
 
     float decoded_distance_stddev() const override;
+
+    bool supports_stable_rerank() const override;
+    float stable_rerank_distance(const float* query,
+                                 const uint8_t* code) const override;
+    void decode_stable(const uint8_t* code,
+                       float* vector_out) const override;
 
     void batch_reencode(const uint8_t* codes,
                         const uint32_t* assignments,

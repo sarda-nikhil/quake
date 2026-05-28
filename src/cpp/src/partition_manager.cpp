@@ -1004,6 +1004,204 @@ double PartitionManager::estimate_probabilistic_split_assignment_stability(
         : 1.0;
 }
 
+PartitionManager::AnchorSplitUtility
+PartitionManager::estimate_anchor_split_utility(int64_t partition_id,
+                                                int knn_iteration) {
+    // Stable-view dry run for a proposed binary split. Returns the two
+    // signals the maintenance gate uses (anchor distortion drop fraction
+    // and an upper bound on assignment disagreement) plus diagnostics.
+    // The gate's contract: representations without a stable view return
+    // |stable_view_available=false|, caller treats that as "no validation"
+    // and accepts the candidate. See spec/anchor_rerank.md.
+    AnchorSplitUtility utility;
+    if (representation_ == nullptr || partition_store_ == nullptr) {
+        return utility;
+    }
+    if (!representation_->supports_stable_rerank()) {
+        return utility;
+    }
+    std::shared_ptr<IndexPartition> source_partition =
+        partition_store_->get_partition(partition_id);
+    if (source_partition == nullptr || source_partition->num_vectors_ < 2) {
+        return utility;
+    }
+
+    const int d = dim_;
+    const int code_size = representation_->code_size_bytes();
+    const int64_t list_size = source_partition->num_vectors_;
+    const int iterations = knn_iteration > 0 ? knn_iteration : 1;
+
+    // Materialize stable reconstructions once. Per spec §"Implementation
+    // Sketch", maintenance can use chunked sufficient statistics for very
+    // large partitions; for the cost-model-nominated partitions we expect
+    // (a small fraction of the index) the flat buffer is simplest and
+    // the working set fits L2 for typical n ~ a few thousand at d=100.
+    std::vector<float> stable(static_cast<size_t>(list_size) *
+                              static_cast<size_t>(d), 0.0f);
+    for (int64_t i = 0; i < list_size; ++i) {
+        representation_->decode_stable(
+            source_partition->codes_ + i * static_cast<int64_t>(code_size),
+            stable.data() + static_cast<size_t>(i) * static_cast<size_t>(d));
+    }
+
+    std::vector<float> c_parent(d);
+    if (!get_partition_centroid(partition_id, c_parent.data())) {
+        // Fallback for standalone tests without a parent centroid store.
+        std::vector<double> sum(d, 0.0);
+        for (int64_t i = 0; i < list_size; ++i) {
+            const float* x = stable.data() +
+                             static_cast<size_t>(i) * static_cast<size_t>(d);
+            for (int j = 0; j < d; ++j) {
+                sum[j] += static_cast<double>(x[j]);
+            }
+        }
+        const double inv_n = 1.0 / static_cast<double>(list_size);
+        for (int j = 0; j < d; ++j) {
+            c_parent[j] = static_cast<float>(sum[j] * inv_n);
+        }
+    }
+
+    // Parent k-means objective Phi_parent = sum_i ||x_stable_i - c_parent||^2.
+    // MaintenancePolicy calls update_centroid before this helper, so for
+    // AnchorCodec this stored centroid is already the mean of the same stable
+    // view used below.
+    double phi_parent = 0.0;
+    for (int64_t i = 0; i < list_size; ++i) {
+        const float* x = stable.data() +
+                         static_cast<size_t>(i) * static_cast<size_t>(d);
+        double row = 0.0;
+        for (int j = 0; j < d; ++j) {
+            const double diff =
+                static_cast<double>(x[j]) - c_parent[j];
+            row += diff * diff;
+        }
+        phi_parent += row;
+    }
+
+    // Initialize child centroids c0, c1 from the first and last stable
+    // reconstructions. Mirrors the seed used by
+    // estimate_probabilistic_split_assignment_stability so the dry run's
+    // child geometry tracks what the real split_partitions() would produce.
+    std::vector<float> c0(d, 0.0f);
+    std::vector<float> c1(d, 0.0f);
+    {
+        const float* x0 = stable.data();
+        const float* x1 = stable.data() +
+                          static_cast<size_t>(list_size - 1) *
+                              static_cast<size_t>(d);
+        std::copy(x0, x0 + d, c0.begin());
+        std::copy(x1, x1 + d, c1.begin());
+    }
+
+    // Binary k-means in stable space. Each iteration recomputes both
+    // assignments and centroids in float to keep this self-contained.
+    std::vector<double> sum0(d, 0.0);
+    std::vector<double> sum1(d, 0.0);
+    int64_t count0 = 0;
+    int64_t count1 = 0;
+    for (int iter = 0; iter < iterations; ++iter) {
+        std::fill(sum0.begin(), sum0.end(), 0.0);
+        std::fill(sum1.begin(), sum1.end(), 0.0);
+        count0 = 0;
+        count1 = 0;
+        for (int64_t i = 0; i < list_size; ++i) {
+            const float* x = stable.data() +
+                             static_cast<size_t>(i) *
+                                 static_cast<size_t>(d);
+            double d0 = 0.0;
+            double d1 = 0.0;
+            for (int j = 0; j < d; ++j) {
+                const double diff0 = static_cast<double>(x[j]) - c0[j];
+                const double diff1 = static_cast<double>(x[j]) - c1[j];
+                d0 += diff0 * diff0;
+                d1 += diff1 * diff1;
+            }
+            std::vector<double>* sum_target =
+                d0 <= d1 ? &sum0 : &sum1;
+            int64_t* count_target = d0 <= d1 ? &count0 : &count1;
+            for (int j = 0; j < d; ++j) {
+                (*sum_target)[j] += static_cast<double>(x[j]);
+            }
+            ++(*count_target);
+        }
+        if (count0 > 0) {
+            const double inv0 = 1.0 / static_cast<double>(count0);
+            for (int j = 0; j < d; ++j) c0[j] = static_cast<float>(sum0[j] * inv0);
+        }
+        if (count1 > 0) {
+            const double inv1 = 1.0 / static_cast<double>(count1);
+            for (int j = 0; j < d; ++j) c1[j] = static_cast<float>(sum1[j] * inv1);
+        }
+    }
+
+    // Child separation Delta = ||c0 - c1||.
+    double delta_sq = 0.0;
+    for (int j = 0; j < d; ++j) {
+        const double diff = static_cast<double>(c0[j]) - c1[j];
+        delta_sq += diff * diff;
+    }
+    const double delta = std::sqrt(delta_sq);
+
+    std::vector<float> source_centroid(d, 0.0f);
+    if (!get_partition_centroid(partition_id, source_centroid.data())) {
+        std::fill(source_centroid.begin(), source_centroid.end(), 0.0f);
+    }
+    const MaintenanceUncertaintyStats uncertainty =
+        representation_->estimate_uncertainty(source_centroid.data(),
+                                              source_partition->codes_,
+                                              static_cast<int>(list_size));
+    const double mean_error_l2 = std::max(0.0, uncertainty.mean_error_l2());
+    const double mean_error_norm = std::sqrt(mean_error_l2);
+
+    // Child distortion sum + assignment disagreement proxy. The
+    // disagreement bound comes from spec §"Assignment stability":
+    // |d_R^2 - d_L^2| > 2 ||e|| Delta implies the stable-space
+    // assignment matches the noiseless FP32 assignment. Telemetry uses the
+    // partition-level mean codec error rather than per-vector tail stats; the
+    // margin-telemetry replay found mean-based proxies much more robust.
+    double phi_children = 0.0;
+    int64_t disagreement_count = 0;
+    for (int64_t i = 0; i < list_size; ++i) {
+        const float* x = stable.data() +
+                         static_cast<size_t>(i) * static_cast<size_t>(d);
+        double d0 = 0.0;
+        double d1 = 0.0;
+        for (int j = 0; j < d; ++j) {
+            const double diff0 = static_cast<double>(x[j]) - c0[j];
+            const double diff1 = static_cast<double>(x[j]) - c1[j];
+            d0 += diff0 * diff0;
+            d1 += diff1 * diff1;
+        }
+        phi_children += std::min(d0, d1);
+        const double margin = std::fabs(d1 - d0);
+        // Margin-stability threshold from spec. When delta == 0 the children
+        // are degenerate; treat all vectors as ambiguous in telemetry.
+        if (delta <= 1e-12) {
+            ++disagreement_count;
+            continue;
+        }
+        if (margin <= 2.0 * mean_error_norm * delta) {
+            ++disagreement_count;
+        }
+    }
+
+    utility.stable_view_available = true;
+    utility.n_evaluated = list_size;
+    if (phi_parent > 1e-12) {
+        utility.distortion_drop_frac =
+            std::max(0.0, (phi_parent - phi_children) / phi_parent);
+    } else {
+        // Degenerate parent (all stable reconstructions coincide). The
+        // children can only equal or exceed Phi_parent; no real signal.
+        utility.distortion_drop_frac = 0.0;
+    }
+    utility.assignment_disagreement_bound =
+        static_cast<double>(disagreement_count) /
+        static_cast<double>(list_size);
+    utility.mean_anchor_error = mean_error_norm;
+    return utility;
+}
+
 void PartitionManager::refine_partitions(Tensor partition_ids, int iterations) {
     if (debug_) {
         std::cout << "[PartitionManager] refine_partitions: Refining partitions with iterations = "

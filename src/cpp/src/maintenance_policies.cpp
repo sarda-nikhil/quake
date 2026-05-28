@@ -47,6 +47,14 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
     vector<int64_t> partitions_to_delete;
     vector<int64_t> partitions_to_recluster;
     vector<std::pair<int64_t, float>> split_candidates;
+    int64_t n_split_candidates = 0;
+    int64_t n_anchor_split_telemetry_candidates = 0;
+    double anchor_distortion_drop_frac_sum = 0.0;
+    double anchor_distortion_drop_frac_min = 0.0;
+    double anchor_distortion_drop_frac_max = 0.0;
+    double anchor_assignment_disagreement_bound_sum = 0.0;
+    double anchor_assignment_disagreement_bound_max = 0.0;
+    double anchor_mean_error_sum = 0.0;
 
     Tensor all_partition_ids_tens = partition_manager_->get_partition_ids();
     vector<int64_t> all_partition_ids = vector<int64_t>(all_partition_ids_tens.data_ptr<int64_t>(),
@@ -249,6 +257,58 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
                             static_cast<double>(
                                 params_->min_split_assignment_probability);
                     }
+                    if (should_split) {
+                        ++n_split_candidates;
+                    }
+                    // Anchor-view split telemetry (spec/anchor_rerank.md
+                    // §"Anchor-Based Split Maintenance"). Runs after the
+                    // latency cost model and any other enabled gates as a
+                    // pure observer: it cannot force or veto a split.
+                    if (should_split &&
+                        (params_->enable_anchor_split_telemetry ||
+                         params_->enable_anchor_split_validation)) {
+                        const auto utility =
+                            partition_manager_
+                                ->estimate_anchor_split_utility(
+                                    partition_id,
+                                    params_->split_knn_iterations);
+                        if (utility.stable_view_available) {
+                            ++n_anchor_split_telemetry_candidates;
+                            anchor_distortion_drop_frac_sum +=
+                                utility.distortion_drop_frac;
+                            if (n_anchor_split_telemetry_candidates == 1) {
+                                anchor_distortion_drop_frac_min =
+                                    utility.distortion_drop_frac;
+                                anchor_distortion_drop_frac_max =
+                                    utility.distortion_drop_frac;
+                            } else {
+                                anchor_distortion_drop_frac_min = std::min(
+                                    anchor_distortion_drop_frac_min,
+                                    utility.distortion_drop_frac);
+                                anchor_distortion_drop_frac_max = std::max(
+                                    anchor_distortion_drop_frac_max,
+                                    utility.distortion_drop_frac);
+                            }
+                            anchor_assignment_disagreement_bound_sum +=
+                                utility.assignment_disagreement_bound;
+                            anchor_assignment_disagreement_bound_max = std::max(
+                                anchor_assignment_disagreement_bound_max,
+                                utility.assignment_disagreement_bound);
+                            anchor_mean_error_sum += utility.mean_anchor_error;
+                            if constexpr(debug_) {
+                                std::cout
+                                    << "[anchor-telemetry] partition "
+                                    << partition_id
+                                    << " distortion_drop_frac="
+                                    << utility.distortion_drop_frac
+                                    << " disagreement_bound="
+                                    << utility.assignment_disagreement_bound
+                                    << " mean_anchor_error="
+                                    << utility.mean_anchor_error
+                                    << std::endl;
+                            }
+                        }
+                    }
                     if constexpr(debug_) std::cout << "For partition " << partition_id << " of size " << partition_size << " got split delta " << split_delta << " leading to split decision of " << should_split << std::endl;
                     if (should_split) {
                         split_candidates.emplace_back(partition_id, split_delta);
@@ -353,6 +413,24 @@ shared_ptr<MaintenanceTimingInfo> MaintenancePolicy::perform_maintenance() {
 
     timing_info->n_splits      = static_cast<int64_t>(partitions_to_split.size());
     timing_info->n_deletes     = static_cast<int64_t>(partitions_to_delete.size());
+    timing_info->n_split_candidates = n_split_candidates;
+    timing_info->n_anchor_split_telemetry_candidates =
+        n_anchor_split_telemetry_candidates;
+    timing_info->anchor_distortion_drop_frac_sum =
+        anchor_distortion_drop_frac_sum;
+    timing_info->anchor_distortion_drop_frac_min =
+        n_anchor_split_telemetry_candidates > 0
+            ? anchor_distortion_drop_frac_min
+            : 0.0;
+    timing_info->anchor_distortion_drop_frac_max =
+        n_anchor_split_telemetry_candidates > 0
+            ? anchor_distortion_drop_frac_max
+            : 0.0;
+    timing_info->anchor_assignment_disagreement_bound_sum =
+        anchor_assignment_disagreement_bound_sum;
+    timing_info->anchor_assignment_disagreement_bound_max =
+        anchor_assignment_disagreement_bound_max;
+    timing_info->anchor_mean_error_sum = anchor_mean_error_sum;
 
     return timing_info;
 }

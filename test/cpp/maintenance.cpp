@@ -213,6 +213,93 @@ TEST(MaintenancePolicyRefactoredTest, RepresentationMultiplierSuppressesMarginal
   EXPECT_TRUE(found1);
 }
 
+TEST(MaintenancePolicyRefactoredTest, AnchorSplitUtilityFP32WellSeparatedClusters) {
+  // FP32PartitionRepresentation reports supports_stable_rerank()=true and its
+  // decode_stable is the identity. A partition built from two well-separated
+  // Gaussian clusters should produce a positive distortion drop fraction and
+  // near-zero assignment disagreement under the anchor-view dry run.
+  constexpr int dim = 16;
+  constexpr int64_t n_per_cluster = 64;
+  constexpr int64_t ntotal = 2 * n_per_cluster;
+  constexpr int64_t nlist = 2;
+
+  auto clustering = make_shared<Clustering>();
+  clustering->partition_ids = torch::arange(nlist, torch::kInt64);
+  Tensor centers = torch::zeros({nlist, dim}, torch::kFloat32);
+  for (int j = 0; j < dim; ++j) {
+    centers[0][j] = -5.0f;
+    centers[1][j] =  5.0f;
+  }
+  // All ntotal vectors go into partition 0 so the gate has a single
+  // multi-cluster partition to evaluate.
+  Tensor c0 = centers[0].unsqueeze(0).expand({n_per_cluster, dim});
+  Tensor c1 = centers[1].unsqueeze(0).expand({n_per_cluster, dim});
+  Tensor vectors = torch::cat({c0, c1}, /*dim=*/0) +
+                   0.05f * torch::randn({ntotal, dim}, torch::kFloat32);
+  Tensor ids = torch::arange(ntotal, torch::kInt64);
+
+  clustering->vectors.push_back(vectors);
+  clustering->vector_ids.push_back(ids);
+  // The lone "other" partition stays empty so partition 0 is the only
+  // candidate for the dry run.
+  clustering->vectors.push_back(torch::empty({0, dim}, torch::kFloat32));
+  clustering->vector_ids.push_back(torch::empty({0}, torch::kInt64));
+  clustering->centroids = vectors.mean(0).unsqueeze(0).expand({nlist, dim}).clone();
+
+  auto parent = make_shared<QuakeIndex>();
+  auto build_params = make_shared<IndexBuildParams>();
+  parent->build(clustering->centroids, clustering->partition_ids, build_params);
+  auto manager = make_shared<PartitionManager>();
+  manager->init_partitions(parent, clustering);
+
+  const auto utility =
+      manager->estimate_anchor_split_utility(/*partition_id=*/0,
+                                             /*knn_iteration=*/5);
+  EXPECT_TRUE(utility.stable_view_available);
+  EXPECT_EQ(utility.n_evaluated, ntotal);
+  // Two clusters at +/-5 with sigma~0.05 should be ~easy to split; the
+  // distortion drop should be large (>0.5). Loose threshold for noise.
+  EXPECT_GT(utility.distortion_drop_frac, 0.5);
+  // FP32 has zero per-vector codec error, so the margin-stability bound
+  // |d_R^2-d_L^2| > 2*0*Delta is satisfied for every nondegenerate vector.
+  EXPECT_LT(utility.assignment_disagreement_bound, 1e-6);
+}
+
+TEST(MaintenancePolicyRefactoredTest, AnchorSplitUtilityFP32NoiseOnlyPartition) {
+  // A partition with no real cluster structure (a single tight Gaussian)
+  // should have a small distortion drop fraction even though FP32's
+  // assignment-disagreement bound stays near zero.
+  constexpr int dim = 16;
+  constexpr int64_t ntotal = 128;
+  constexpr int64_t nlist = 2;
+
+  auto clustering = make_shared<Clustering>();
+  clustering->partition_ids = torch::arange(nlist, torch::kInt64);
+  Tensor vectors = 0.1f * torch::randn({ntotal, dim}, torch::kFloat32);
+  Tensor ids = torch::arange(ntotal, torch::kInt64);
+
+  clustering->vectors.push_back(vectors);
+  clustering->vector_ids.push_back(ids);
+  clustering->vectors.push_back(torch::empty({0, dim}, torch::kFloat32));
+  clustering->vector_ids.push_back(torch::empty({0}, torch::kInt64));
+  clustering->centroids =
+      vectors.mean(0).unsqueeze(0).expand({nlist, dim}).clone();
+
+  auto parent = make_shared<QuakeIndex>();
+  auto build_params = make_shared<IndexBuildParams>();
+  parent->build(clustering->centroids, clustering->partition_ids, build_params);
+  auto manager = make_shared<PartitionManager>();
+  manager->init_partitions(parent, clustering);
+
+  const auto utility =
+      manager->estimate_anchor_split_utility(/*partition_id=*/0,
+                                             /*knn_iteration=*/5);
+  EXPECT_TRUE(utility.stable_view_available);
+  // No cluster structure: the two-means objective beats one-means only by
+  // splitting the Gaussian in half. The drop fraction is small (<0.5).
+  EXPECT_LT(utility.distortion_drop_frac, 0.5);
+}
+
 TEST(MaintenancePolicyRefactoredTest, CapsSplitsPerMaintenanceRound) {
   auto [parent, manager] = CreateParentAndManager(8, 4, 400);
   auto params = make_shared<MaintenancePolicyParams>();

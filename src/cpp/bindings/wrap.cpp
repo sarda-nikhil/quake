@@ -694,6 +694,14 @@ PYBIND11_MODULE(_bindings, m) {
              "Indices of the nearest neighbors.")
          .def_readwrite("timing_info", &SearchResult::timing_info,
              "Timing information for the search operation.")
+         .def_readwrite("rerank_candidate_ids", &SearchResult::rerank_candidate_ids,
+             "Residual top-M candidate IDs used by stable rerank.")
+         .def_readwrite("rerank_candidate_distances",
+             &SearchResult::rerank_candidate_distances,
+             "Residual top-M candidate distances used by stable rerank.")
+         .def_readwrite("rerank_candidate_stable_l2sq",
+             &SearchResult::rerank_candidate_stable_l2sq,
+             "Stable L2^2 distances for residual top-M candidates.")
          .def_readwrite("rerank_variant_names", &SearchResult::rerank_variant_names,
              "Names for optional rerank sweep variants.")
          .def_readwrite("rerank_variant_ids", &SearchResult::rerank_variant_ids,

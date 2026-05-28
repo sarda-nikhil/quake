@@ -169,6 +169,53 @@ public:
         int knn_iteration = DEFAULT_NITER);
 
     /**
+     * @brief Output of the anchor-view split validation dry run.
+     *
+     * The k-means and assignment-stability machinery operates on the codec's
+     * *stable* (immutable, topology-independent) reconstructions for each
+     * blob in the candidate partition. For AnchorCodec this is the anchor
+     * view; for FP32 it is the stored vector. Representations whose codec
+     * lacks a stable view return |stable_view_available=false| and the
+     * other fields are not meaningful (the gate then accepts the candidate).
+     */
+    struct AnchorSplitUtility {
+        bool stable_view_available = false;
+        // Distortion drop fraction: (Phi_parent - (Phi_left + Phi_right)) /
+        // Phi_parent, where Phi is the k-means objective in stable space.
+        // Range [0, 1]; larger means the split separates real structure.
+        double distortion_drop_frac = 0.0;
+        // Upper bound on the fraction of partition members whose
+        // stable-space assignment to a child centroid would flip under a
+        // hypothetical noiseless FP32 reconstruction. Derived from the
+        // margin |d_R^2 - d_L^2| <= 2 ||e|| Delta condition (spec
+        // §"Assignment stability"). Range [0, 1]; smaller means the
+        // assignments are robust to per-vector codec error.
+        double assignment_disagreement_bound = 0.0;
+        // Mean per-vector stable-view reconstruction error sqrt(error_l2).
+        // Diagnostic; used to compute assignment_disagreement_bound.
+        double mean_anchor_error = 0.0;
+        // Number of partition members evaluated.
+        int64_t n_evaluated = 0;
+    };
+
+    /**
+     * @brief Anchor-view split validation (spec/anchor_rerank.md
+     * §"Anchor-Based Split Maintenance").
+     *
+     * Runs a non-mutating, stable-view-only dry run of the binary split that
+     * MaintenancePolicy is about to execute. Reuses
+     * assign_to_centroids_and_accumulate for the k-means iterations but
+     * substitutes decode_stable() for reconstruct() so the validator never
+     * sees the residual-+-centroid reconstruction that gets rewritten on
+     * every ReEncode. Returns the two gate signals
+     * (distortion_drop_frac, assignment_disagreement_bound) plus a
+     * stable_view_available flag for codecs without an immutable view.
+     */
+    AnchorSplitUtility estimate_anchor_split_utility(
+        int64_t partition_id,
+        int knn_iteration = DEFAULT_NITER);
+
+    /**
      * @brief Select partitions and their centroids.
      * @param partition_ids Tensor of shape [num_partitions] containing partition IDs.
      * @param copy If true, copies the data; otherwise, uses references.

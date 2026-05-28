@@ -1395,6 +1395,7 @@ void QueryCoordinator::apply_stable_rerank(const Tensor& queries,
                                             int k,
                                             Tensor& out_ids,
                                             Tensor& out_dists,
+                                            Tensor& candidate_stable_l2sq,
                                             vector<string>& variant_names,
                                             vector<Tensor>& variant_ids,
                                             vector<Tensor>& variant_dists) {
@@ -1405,6 +1406,7 @@ void QueryCoordinator::apply_stable_rerank(const Tensor& queries,
 
     auto ca = candidate_ids.accessor<int64_t, 2>();
     auto cd = candidate_dists.accessor<float, 2>();
+    auto cs = candidate_stable_l2sq.accessor<float, 2>();
     auto oi = out_ids.accessor<int64_t, 2>();
     auto od = out_dists.accessor<float, 2>();
     // queries is forced contiguous on the caller side (torch::empty in
@@ -1448,12 +1450,15 @@ void QueryCoordinator::apply_stable_rerank(const Tensor& queries,
         // returned fewer than M candidates for this query). Drop them
         // before the rerank pass.
         std::vector<int64_t> valid_ids;
+        std::vector<int64_t> valid_positions;
         std::vector<float> valid_residual_l2;
         valid_ids.reserve(static_cast<size_t>(M));
+        valid_positions.reserve(static_cast<size_t>(M));
         valid_residual_l2.reserve(static_cast<size_t>(M));
         for (int64_t i = 0; i < M; ++i) {
             if (ca[q][i] >= 0) {
                 valid_ids.push_back(ca[q][i]);
+                valid_positions.push_back(i);
                 valid_residual_l2.push_back(cd[q][i]);
             }
         }
@@ -1485,6 +1490,7 @@ void QueryCoordinator::apply_stable_rerank(const Tensor& queries,
             }
             const auto* code = reinterpret_cast<const uint8_t*>(code_ptrs[i]);
             const float stable_d2 = rep->stable_rerank_distance(query, code);
+            cs[q][valid_positions[i]] = stable_d2;
             const float residual_l2 = valid_residual_l2[i];
             const float residual_d2 = std::isfinite(residual_l2)
                 ? residual_l2 * residual_l2
@@ -1738,18 +1744,24 @@ std::shared_ptr<SearchResult> QueryCoordinator::worker_scan(
         // existing K-loop fills the full residual heap.
         Tensor cand_ids = torch::empty({nQ, effective_K}, torch::kLong);
         Tensor cand_dists = torch::empty({nQ, effective_K}, torch::kFloat);
+        Tensor cand_stable_l2sq = torch::full(
+            {nQ, effective_K}, std::numeric_limits<float>::infinity(),
+            torch::kFloat);
         auto cand_res = aggregate_scan_results(nQ, effective_K, timing,
                                                cand_ids, cand_dists);
         vector<string> variant_names;
         vector<Tensor> variant_ids;
         vector<Tensor> variant_dists;
         apply_stable_rerank(x, cand_ids, cand_dists, params, K,
-                            out_ids, out_dists, variant_names, variant_ids,
-                            variant_dists);
+                            out_ids, out_dists, cand_stable_l2sq,
+                            variant_names, variant_ids, variant_dists);
         res = std::make_shared<SearchResult>();
         res->ids = out_ids;
         res->distances = out_dists;
         res->timing_info = cand_res->timing_info;
+        res->rerank_candidate_ids = cand_ids;
+        res->rerank_candidate_distances = cand_dists;
+        res->rerank_candidate_stable_l2sq = cand_stable_l2sq;
         res->rerank_variant_names = std::move(variant_names);
         res->rerank_variant_ids = std::move(variant_ids);
         res->rerank_variant_distances = std::move(variant_dists);

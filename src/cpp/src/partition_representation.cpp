@@ -247,6 +247,25 @@ float PartitionRepresentation::maintenance_split_threshold_multiplier() const {
     return 1.0f;
 }
 
+bool PartitionRepresentation::supports_stable_rerank() const {
+    return false;
+}
+
+float PartitionRepresentation::stable_rerank_distance(
+    const float* /*query*/,
+    const uint8_t* /*code*/) const {
+    throw std::runtime_error(
+        "PartitionRepresentation::stable_rerank_distance: "
+        "representation does not expose a stable view");
+}
+
+void PartitionRepresentation::decode_stable(const uint8_t* /*code*/,
+                                            float* /*vector_out*/) const {
+    throw std::runtime_error(
+        "PartitionRepresentation::decode_stable: "
+        "representation does not expose a stable view");
+}
+
 void PartitionRepresentation::encode_batch(const float* vectors,
                                            const float* centroids,
                                            int n,
@@ -600,6 +619,31 @@ MaintenanceUncertaintyStats Fp32PartitionRepresentation::estimate_uncertainty(
     return stats;
 }
 
+bool Fp32PartitionRepresentation::supports_stable_rerank() const {
+    return true;
+}
+
+float Fp32PartitionRepresentation::stable_rerank_distance(
+    const float* query,
+    const uint8_t* code) const {
+    // FP32 stores the exact vector; the stable distance is the L2² to query.
+    const float* x = reinterpret_cast<const float*>(code);
+    double sum = 0.0;
+    for (int i = 0; i < dim_; ++i) {
+        const double diff =
+            static_cast<double>(query[i]) - static_cast<double>(x[i]);
+        sum += diff * diff;
+    }
+    return static_cast<float>(sum);
+}
+
+void Fp32PartitionRepresentation::decode_stable(const uint8_t* code,
+                                                float* vector_out) const {
+    // FP32 storage is lossless; stable view is the stored vector itself.
+    std::memcpy(vector_out, code,
+                static_cast<size_t>(dim_) * sizeof(float));
+}
+
 void Fp32PartitionRepresentation::batch_reencode(const uint8_t* codes,
                                                  const uint32_t* /*assignments*/,
                                                  const float* /*centroids*/,
@@ -719,6 +763,25 @@ float HssiPartitionRepresentation::maintenance_split_threshold_multiplier() cons
 
 float HssiPartitionRepresentation::decoded_distance_stddev() const {
     return codec_->DecodedDistanceStdDev();
+}
+
+bool HssiPartitionRepresentation::supports_stable_rerank() const {
+    return codec_->SupportsStableRerank();
+}
+
+float HssiPartitionRepresentation::stable_rerank_distance(
+    const float* query,
+    const uint8_t* code) const {
+    return codec_->StableRerankDistance(query, code);
+}
+
+void HssiPartitionRepresentation::decode_stable(const uint8_t* code,
+                                                float* vector_out) const {
+    // Forward to the codec's stable-view materialization. For AnchorCodec
+    // this is the anchor reconstruction g_a + Q_anchor(x - g_a), which is
+    // invariant under ReEncode by construction; for codecs without an
+    // immutable prefix this throws, matching the contract of the base.
+    codec_->DecodeStable(code, vector_out);
 }
 
 int HssiPartitionRepresentation::prepared_centroid_size_bytes() const {

@@ -362,6 +362,7 @@ private:
                              int k,
                              Tensor& out_ids,
                              Tensor& out_dists,
+                             Tensor& candidate_stable_l2sq,
                              vector<string>& variant_names,
                              vector<Tensor>& variant_ids,
                              vector<Tensor>& variant_dists);

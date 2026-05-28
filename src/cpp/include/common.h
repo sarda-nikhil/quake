@@ -451,6 +451,9 @@ struct SearchResult {
     Tensor ids;
     Tensor distances;
     shared_ptr<SearchTimingInfo> timing_info;
+    Tensor rerank_candidate_ids;
+    Tensor rerank_candidate_distances;
+    Tensor rerank_candidate_stable_l2sq;
     vector<string> rerank_variant_names;
     vector<Tensor> rerank_variant_ids;
     vector<Tensor> rerank_variant_distances;
