@@ -140,6 +140,7 @@ if(QUAKE_USE_HSSI)
         ${HSSI_ROOT}/src/factories_pq.cc
         ${HSSI_ROOT}/src/factories_tq.cc
         ${HSSI_ROOT}/src/fp32_codec.cc
+        ${HSSI_ROOT}/src/generational_codec.cc
         ${HSSI_ROOT}/src/kmeans.cc
         ${HSSI_ROOT}/src/pq.cc
         ${HSSI_ROOT}/src/quantizer.cc
