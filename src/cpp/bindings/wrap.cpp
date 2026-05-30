@@ -174,6 +174,43 @@ PYBIND11_MODULE(_bindings, m) {
              return out;
          }, arg("ids"),
              "Return the current leaf partition ID for each vector ID, or -1 if absent.")
+        .def("debug_id_to_generation", [](QuakeIndex &q, Tensor ids) {
+             if (!q.partition_manager_ || !q.partition_manager_->partition_store_) {
+                 throw std::runtime_error("QuakeIndex has no partition store.");
+             }
+             ids = ids.contiguous();
+             auto out = torch::full({ids.size(0)}, -1, torch::kInt64);
+             auto in_acc = ids.accessor<int64_t, 1>();
+             auto out_acc = out.accessor<int64_t, 1>();
+             auto store = q.partition_manager_->partition_store_;
+             if (store->id_to_location_.empty()) {
+                 store->build_map();
+             }
+             for (int64_t i = 0; i < ids.size(0); ++i) {
+                 const int64_t id = in_acc[i];
+                 if (id < 0) {
+                     continue;
+                 }
+                 auto it = store->id_to_location_.find(id);
+                 if (it == store->id_to_location_.end() ||
+                     it->second.first == nullptr) {
+                     continue;
+                 }
+                 IndexPartition* part = it->second.first;
+                 const int64_t pos = it->second.second;
+                 if (part->codes_ == nullptr || part->code_size_ <= 0 ||
+                     pos < 0 || pos >= part->num_vectors_) {
+                     continue;
+                 }
+                 // Generational HSSI blobs are [generation_id:uint8][inner].
+                 // Non-generational blobs do not carry a tag; callers treat
+                 // the returned zero as the single implicit generation.
+                 out_acc[i] = static_cast<int64_t>(
+                     part->codes_[pos * part->code_size_]);
+             }
+             return out;
+         }, arg("ids"),
+             "Return each vector's stored generation tag byte, or -1 if absent.")
         .def("debug_partition_snapshot", [](QuakeIndex &q, Tensor partition_ids) {
              if (!q.partition_manager_) {
                  throw std::runtime_error("QuakeIndex has no partition manager.");
